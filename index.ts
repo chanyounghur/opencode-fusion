@@ -190,6 +190,9 @@ interface FusionSettings {
 
 const PLUGIN_ID = "fusion";
 const DEFAULT_MODE_NAME = "Fusion";
+// OpenCode colours a mode by its place in the mode list unless the agent names a colour, and starting in this mode
+// moves it to the front of that list. A colour of its own keeps the mode looking the same either way.
+const DEFAULT_MODE_COLOR = "#ef6c6c";
 const DEFAULT_FELLOW_NAME = "fellow";
 const MAX_MODE_NAME_LENGTH = 24;
 // OpenCode's own agents. A mode cannot take one of their names.
@@ -1175,6 +1178,8 @@ export default {
         agent.hidden = false;
         // The mode as the user sees it, next to Build and Plan.
         agent.name = modeNameInForce;
+        // A colour given in the configuration (`agents.<mode>.color`) is kept.
+        if (agent.color === undefined) agent.color = DEFAULT_MODE_COLOR;
         if (agent.steps === undefined) agent.steps = DEFAULT_AGENT_STEPS;
         agent.description = directEnabled
           ? "Architect/Reviewer Lead: makes small, certain changes itself (work_directly) and hands larger work off via handoff_to_fellow."

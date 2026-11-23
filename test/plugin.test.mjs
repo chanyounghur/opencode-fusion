@@ -1462,6 +1462,13 @@ test("16. Fusion mode: one more mode under a chosen name, a hidden Fellow, and s
   assert.equal(fellow().hidden, true);
   assert.equal(lead().model, undefined);
   assert.equal(lead().steps, 200);
+  // The mode names its own colour, so it looks the same wherever it stands in the mode list. A colour from the
+  // configuration is kept.
+  assert.equal(lead().color, "#ef6c6c");
+  lead().color = "#123456";
+  await mock.ctx.agent.reload();
+  assert.equal(lead().color, "#123456");
+  assert.equal(fellow().color, undefined);
   assert.match(lead().system, /Fusion LEAD/);
   assert.match(fellow().system, /Fusion FELLOW/);
   assert.equal(mock.getDefaultAgent(), "build");
