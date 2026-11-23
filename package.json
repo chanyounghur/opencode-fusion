@@ -1,6 +1,6 @@
 {
   "name": "opencode-fusion",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Fusion mode for OpenCode: a strong Lead model plans and reviews, a cheaper Fellow model does the long stretches of work.",
   "keywords": ["opencode", "opencode-plugin"],
   "type": "module",

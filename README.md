@@ -26,15 +26,15 @@ Windows에서 만들고 확인했습니다. macOS와 Linux에서는 아직 확�
 ## 설치
 
 ```sh
-opencode plugin add git+https://github.com/chanyounghur/opencode-fusion.git#v0.1.0
+opencode plugin add git+https://github.com/chanyounghur/opencode-fusion.git#v0.1.1
 ```
 
 설치한 뒤 OpenCode를 다시 엽니다. 이제 어느 폴더에서 열어도 Fusion 모드가 있습니다.
 
-주소 끝의 `#v0.1.0`은 받을 버전입니다. OpenCode는 한 번 받은 주소를 다시 받지 않으므로, 새 버전으로 바꿀 때는 지우고 새 버전 주소로 다시 설치합니다.
+주소 끝의 `#v0.1.1`은 받을 버전입니다. OpenCode는 한 번 받은 주소를 다시 받지 않으므로, 새 버전으로 바꿀 때는 지우고 새 버전 주소로 다시 설치합니다.
 
 ```sh
-opencode plugin remove git+https://github.com/chanyounghur/opencode-fusion.git#v0.1.0
+opencode plugin remove git+https://github.com/chanyounghur/opencode-fusion.git#v0.1.1
 ```
 
 ```sh
@@ -57,9 +57,11 @@ opencode plugin add git+https://github.com/chanyounghur/opencode-fusion.git#v0.2
 | 지금 누가 일하는지 보기 | `/fusion-status` |
 | Fellow가 일하는 중에 방향 바꾸기 | 그냥 말을 겁니다. Lead가 받아서 다시 계획합니다. |
 | Fellow에게 바로 한마디 하기 | 메시지를 `>>`로 시작합니다. |
+| Lead와 Fellow 모델 보기 | Fusion 세션에서는 입력창 아래 줄에 `Lead … · Fellow …`가 나옵니다. 지금 일하는 쪽이 밝게 보입니다. 화면이 좁으면(100칸 미만) 숨깁니다. |
 | 모델 바꾸기 | `/fusion-settings`. 바로 적용됩니다. |
 | 모드 이름 바꾸기 | `/fusion-settings`. OpenCode를 다시 열면 바뀝니다. 영문자, 숫자, `-`만 쓸 수 있습니다. |
 | OpenCode를 Fusion 모드로 시작하기 | `/fusion-settings`에서 켭니다. |
+| 모드 색 바꾸기 | `opencode.json`에 `"agents": { "fusion": { "color": "#3b82f6" } }`처럼 적습니다. |
 
 화면 없이 한 번만 돌릴 때는 이렇게 합니다.
 
@@ -75,7 +77,7 @@ opencode run --standalone --agent fusion "요청"
 {
   "plugins": [
     {
-      "package": "git+https://github.com/chanyounghur/opencode-fusion.git#v0.1.0",
+      "package": "git+https://github.com/chanyounghur/opencode-fusion.git#v0.1.1",
       "options": { "fellowModel": "<제공자>/<모델>", "maxFellowSteps": 100 }
     }
   ]
