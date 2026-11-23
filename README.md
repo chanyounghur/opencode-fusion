@@ -26,20 +26,28 @@ Windows에서 만들고 확인했습니다. macOS와 Linux에서는 아직 확�
 ## 설치
 
 ```sh
-opencode plugin add git+https://github.com/chanyounghur/opencode-fusion.git#v0.1.1
+opencode plugin add git+https://github.com/chanyounghur/opencode-fusion.git
 ```
 
 설치한 뒤 OpenCode를 다시 엽니다. 이제 어느 폴더에서 열어도 Fusion 모드가 있습니다.
 
-주소 끝의 `#v0.1.1`은 받을 버전입니다. OpenCode는 한 번 받은 주소를 다시 받지 않으므로, 새 버전으로 바꿀 때는 지우고 새 버전 주소로 다시 설치합니다.
+새 버전이 나왔는지 보고 올리려면 이렇게 합니다. 올린 뒤에도 OpenCode를 다시 엽니다.
 
 ```sh
-opencode plugin remove git+https://github.com/chanyounghur/opencode-fusion.git#v0.1.1
+opencode plugin check
 ```
 
 ```sh
-opencode plugin add git+https://github.com/chanyounghur/opencode-fusion.git#v0.2.0
+opencode plugin update
 ```
+
+지울 때는 이렇게 합니다.
+
+```sh
+opencode plugin remove git+https://github.com/chanyounghur/opencode-fusion.git
+```
+
+특정 버전에 고정하려면 주소 끝에 태그를 붙여 설치합니다(예: `…/opencode-fusion.git#v0.1.1`). 고정한 설치는 `opencode plugin update`로 올라가지 않습니다.
 
 ## 처음 쓰기
 
@@ -77,7 +85,7 @@ opencode run --standalone --agent fusion "요청"
 {
   "plugins": [
     {
-      "package": "git+https://github.com/chanyounghur/opencode-fusion.git#v0.1.1",
+      "package": "git+https://github.com/chanyounghur/opencode-fusion.git",
       "options": { "fellowModel": "<제공자>/<모델>", "maxFellowSteps": 100 }
     }
   ]
