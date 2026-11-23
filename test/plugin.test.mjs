@@ -830,6 +830,14 @@ test("6. prompt bypass/reason, experimental.idle shell vs subagent, completed cl
   assert.equal(mock.sessions.get("ses_1").agent, "fellow");
 
   await idleHook({ sessionID: "ses_1", background: [{ kind: "shell", sessionID: "ses_1", shellID: "sh_1", command: "npm run dev" }] });
+  // The first stop without a hand-back: Fellow is asked once to make the call, and stays at work.
+  assert.equal(mock.sessions.get("ses_1").agent, "fellow");
+  assert.match(mock.syntheticCalls.at(-1).text, /YOU STOPPED WITHOUT HANDING BACK/);
+  assert.match(mock.syntheticCalls.at(-1).text, /as a real tool call/);
+  assert.equal(mock.syntheticCalls.at(-1).resume, true);
+  assert.deepEqual(mock.syntheticCalls.at(-1).metadata, { fusion: { route: "fellow" } });
+  // The second stop in the same round goes to Lead.
+  await idleHook({ sessionID: "ses_1", background: [{ kind: "shell", sessionID: "ses_1", shellID: "sh_1", command: "npm run dev" }] });
   assert.equal(mock.sessions.get("ses_1").agent, "lead");
   assert.equal(mock.storage.get("fusion:ses_1").lastReturnReason, "fellow_idle_without_handoff");
   assert.equal(mock.syntheticCalls.at(-1).resume, true);

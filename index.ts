@@ -129,6 +129,8 @@ interface FusionState {
   // Consecutive Fellow rounds that came back unclean without changing the workspace.
   stalledReturns: number;
   lastWorkHash?: string;
+  // The epoch in which Fellow was already asked once to hand back properly after stopping without a tool call.
+  idleNudgeEpoch?: number;
   // Which phase Fellow is on (0-based), and how often its checkpoint was sent back by failing checks.
   phaseIndex: number;
   phaseBounces: number;
@@ -1473,6 +1475,7 @@ export default {
         verifyBounces: typeof data.verifyBounces === "number" && data.verifyBounces >= 0 ? data.verifyBounces : 0,
         stalledReturns: typeof data.stalledReturns === "number" && data.stalledReturns >= 0 ? data.stalledReturns : 0,
         ...(typeof data.lastWorkHash === "string" ? { lastWorkHash: data.lastWorkHash } : {}),
+        ...(typeof data.idleNudgeEpoch === "number" ? { idleNudgeEpoch: data.idleNudgeEpoch } : {}),
         phaseIndex: typeof data.phaseIndex === "number" && data.phaseIndex >= 0 ? data.phaseIndex : 0,
         phaseBounces: typeof data.phaseBounces === "number" && data.phaseBounces >= 0 ? data.phaseBounces : 0,
         ...(typeof data.awaitingCheckpoint === "number" ? { awaitingCheckpoint: data.awaitingCheckpoint } : {}),
@@ -2813,6 +2816,24 @@ export default {
             return;
           }
           if (state.role !== "fellow") return;
+
+          // Fellow stopped without handing back. Often it wrote the tool call out as text (some models do), or simply
+          // forgot. Asked once per round, it usually makes the call; a second stop goes to Lead as before.
+          if (state.idleNudgeEpoch !== state.epoch) {
+            await saveState({ ...state, idleNudgeEpoch: state.epoch, revision: state.revision + 1 });
+            await ctx.session.synthetic({
+              sessionID,
+              text: [
+                "[FUSION: YOU STOPPED WITHOUT HANDING BACK]",
+                "Your turn ended without a tool call, so nothing was reported. If your last message wrote a tool call out as text (for example `<｜DSML｜…>` or `<invoke name=…>`), it was not carried out: make that call again as a real tool call.",
+                "When the work or the current phase is done, call `report_checkpoint` (a plan with phases) or `handoff_to_lead`. If you are stuck or need a decision, call `handoff_to_lead` with reason `blocked` or `need_replan`. Do not answer with text alone.",
+              ].join("\n"),
+              delivery: "steer",
+              resume: true,
+              metadata: { fusion: { route: "fellow" } },
+            });
+            return;
+          }
 
           const context = await unplannedReturnContext(sessionID, state, { runPlanChecks: true });
           const next = await switchRole({
