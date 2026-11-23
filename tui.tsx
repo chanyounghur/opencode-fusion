@@ -1,11 +1,17 @@
+/** @jsxImportSource @opentui/solid */
 /**
  * Fusion — the TUI part.
  *
  * Adds `/fusion-settings`: a menu where the user picks the Lead and Fellow models from the models OpenCode really has,
  * names the mode, and chooses whether OpenCode starts in it. Nothing is kept here: every value is read from and saved
  * through the server part (`index.ts`, RPC `fusion`), so any other client of the same server sees the same settings.
+ *
+ * Also shows both models under the prompt of a Fusion session ("Lead … · Fellow …"), the one at work in full colour.
+ * OpenCode's own line above it names only the model of whoever is working at the moment.
  */
 import { appendFileSync } from "node:fs";
+import { useTerminalDimensions } from "@opentui/solid";
+import { Show, createEffect, createMemo, createSignal } from "solid-js";
 
 const RPC_ID = "fusion";
 const DEFAULT_MODE_NAME = "Fusion";
@@ -36,6 +42,15 @@ interface Snapshot {
 }
 
 type Role = "lead" | "fellow";
+
+interface ModelRef {
+  providerID: string;
+  id: string;
+  variant?: string;
+}
+
+// Below this width the line under the prompt is left to OpenCode's own path and shortcuts.
+const MIN_WIDTH_FOR_ROLE_MODELS = 100;
 
 const ROLE_KEY: Record<Role, "leadModel" | "fellowModel"> = { lead: "leadModel", fellow: "fellowModel" };
 const ROLE_LABEL: Record<Role, string> = { lead: "Lead", fellow: "Fellow" };
@@ -111,6 +126,67 @@ export default {
       }
     }
 
+    // What the line under the prompt needs: the two agents' ids and the models' names. Read once, and again after a
+    // save from `/fusion-settings` (`settingsRevision` also makes open sessions ask for their models again).
+    const [catalog, setCatalog] = createSignal<{ agents: { lead: string; fellow: string }; models: ModelChoice[] }>();
+    const [settingsRevision, setSettingsRevision] = createSignal(0);
+    async function loadCatalog() {
+      try {
+        const snapshot = await call("getSettings", {});
+        setCatalog({ agents: snapshot.agents, models: snapshot.models });
+      } catch (err) {
+        debug("catalog error", errorText(err));
+      }
+      setSettingsRevision((n) => n + 1);
+    }
+
+    function RoleModels(props: { sessionID?: string }) {
+      const dimensions = useTerminalDimensions();
+      const session = createMemo(() => (props.sessionID ? api.data.session.get(props.sessionID) : undefined));
+      // Who is working in this session, or nothing when the session is in another mode.
+      const working = createMemo<Role | undefined>(() => {
+        const agents = catalog()?.agents;
+        const agent = session()?.agent;
+        if (!agents || !agent) return undefined;
+        return agent === agents.lead ? "lead" : agent === agents.fellow ? "fellow" : undefined;
+      });
+      // As text, so the question below is asked again only when the model really changes, not on every session update.
+      const sessionModel = createMemo(() => JSON.stringify(session()?.model ?? null));
+      const [roleModels, setRoleModels] = createSignal<{ lead?: ModelRef; fellow?: ModelRef }>();
+      createEffect(() => {
+        const sessionID = props.sessionID;
+        // Asked again when the role changes hands, the session's model changes, or settings are saved.
+        const role = working();
+        sessionModel();
+        settingsRevision();
+        if (!sessionID || !role) {
+          setRoleModels(undefined);
+          return;
+        }
+        call("getState", { sessionID })
+          .then((state: any) => setRoleModels(state?.roleModels ?? {}))
+          .catch((err: unknown) => debug("state error", errorText(err)));
+      });
+      const name = (role: Role) => {
+        const ref = roleModels()?.[role];
+        if (!ref) return role === "lead" ? "화면에서 고른 모델" : "정하지 않음";
+        const known = catalog()?.models.find((m) => m.providerID === ref.providerID && m.id === ref.id);
+        return known ? known.name : ref.id;
+      };
+      const color = (role: Role) => (working() === role ? api.theme.text.base : api.theme.text.muted);
+      return (
+        <Show when={working() && roleModels() && dimensions().width >= MIN_WIDTH_FOR_ROLE_MODELS}>
+          <box flexShrink={0}>
+            <text fg={api.theme.text.muted}>
+              <span style={{ fg: color("lead") }}>Lead {name("lead")}</span>
+              {" · "}
+              <span style={{ fg: color("fellow") }}>Fellow {name("fellow")}</span>
+            </text>
+          </box>
+        </Show>
+      );
+    }
+
     function toast(variant: "success" | "error" | "info", message: string) {
       api.ui.toast.show({ variant, title: "Fusion", message });
     }
@@ -123,6 +199,7 @@ export default {
         return snapshot;
       }
       await refreshModes();
+      void loadCatalog();
       toast("success", done);
       // The save answers without the model list; the one already loaded is still right.
       return { ...next, models: snapshot.models };
@@ -293,6 +370,11 @@ export default {
     }
 
     debug("setup", { location: api.location, keys: Object.keys(api) });
+    void loadCatalog();
+    api.ui.slot({
+      append: "prompt.footer.status",
+      render: (slot: { sessionID?: string }) => <RoleModels sessionID={slot.sessionID} />,
+    });
     api.keymap.layer(() => ({
       mode: "global",
       commands: [

@@ -7,9 +7,9 @@
   "license": "MIT",
   "exports": {
     "./server": "./index.ts",
-    "./tui": "./tui.ts"
+    "./tui": "./tui.tsx"
   },
-  "files": ["index.ts", "tui.ts"],
+  "files": ["index.ts", "tui.tsx"],
   "scripts": {
     "test": "node --test test/plugin.test.mjs",
     "test:server": "node --test test/server.test.mjs"

@@ -18,7 +18,7 @@
  * - Portable RPC contract `fusion` (getState, forceReturn, setRoleModel, getSettings, setSettings, changed event)
  * - One more mode next to Build and Plan: the Lead agent carries a name of the user's choice (default "Fusion",
  *   agent id `fusion`), the Fellow agent is hidden (`fellow`). Models and the name are chosen in `/fusion-settings`
- *   (the TUI part, `tui.ts`) and saved in one file per user. Models apply at once, a new name at the next start.
+ *   (the TUI part, `tui.tsx`) and saved in one file per user. Models apply at once, a new name at the next start.
  *   Values given in the configuration win.
  * - Verification gate: the plan's `checks` are run by the plugin itself when Fellow reports completion; failing
  *   checks go straight back to Fellow (no Lead call), and Lead receives real results plus a change summary
