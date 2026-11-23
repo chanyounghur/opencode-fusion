@@ -7,8 +7,7 @@ import os from "node:os";
 import path from "node:path";
 
 function createMockOpenCode(givenOptions = {}, mockOpts = {}) {
-  // Tests 1–12 describe the loop where Lead only reads and plans, so direct work (on by default in the plugin)
-  // is off here unless a test asks for it. `{ directWork: undefined }` gives the plugin's own default.
+  // Lead only reads and plans unless a test switches direct work on (`directWork: true`), as in the plugin itself.
   // Saved settings are off too (`settingsFile: false`), so a test never reads the settings file of whoever runs it.
   // The mode is called `lead` here so that the agent ids read as the roles; the plugin's own default is `fusion`,
   // which test 16 covers.
@@ -368,7 +367,6 @@ test("1. agent.system, codemode:false, and upper-bound PLAN allowlist preserve s
     "edit",
     "write",
     "patch",
-    "shell",
     "subagent",
     "execute",
     "todowrite",
@@ -389,6 +387,8 @@ test("1. agent.system, codemode:false, and upper-bound PLAN allowlist preserve s
       `Expected ${deniedAction} denied in lead strict allowlist`,
     );
   }
+  // The shell passes the agent's rules; each call is held to read-only commands in `execute.before` (test 17).
+  assert.equal(resolvePermissionEffect(lead.permissions, "shell"), "allow");
 
   for (const allowedAction of [
     "read",
@@ -425,11 +425,14 @@ test("2. execute.before blocks Lead mutations and post-return sibling mutating t
   const before = mock.toolBeforeHooks[0];
   const toExec = mock.tools.get("handoff_to_fellow");
 
+  await assert.rejects(
+    () => before({ tool: "shell", agent: "lead", sessionID: "ses_1", id: "call_shell", input: { command: "npm install" } }),
+    /read-only commands only/,
+  );
   for (const tool of [
     "edit",
     "write",
     "patch",
-    "shell",
     "subagent",
     "execute",
     "handoff_to_lead",
@@ -1322,21 +1325,18 @@ test("13. direct work: closed until work_directly, counted against a budget, fin
   assert.equal(stored().direct, undefined);
   await cleanup?.();
 
-  // The plugin's own default is on.
-  const byDefault = createMockOpenCode({ directWork: undefined });
-  const cleanupDefault = await plugin.setup(byDefault.ctx);
-  assert.ok(byDefault.tools.get("work_directly"));
-  assert.doesNotMatch(byDefault.agents.get("lead").system, /strict read-only/);
-  await cleanupDefault?.();
-
-  // Switched off nothing changes: no tools, the read-only prompt, edits denied by the agent's own rules.
-  const off = createMockOpenCode({ directWork: false });
-  const cleanupOff = await plugin.setup(off.ctx);
-  assert.equal(off.tools.get("work_directly"), undefined);
-  assert.equal(off.tools.get("finish_direct"), undefined);
-  assert.match(off.agents.get("lead").system, /strict read-only/);
-  assert.equal(resolvePermissionEffect(off.agents.get("lead").permissions, "edit"), "deny");
-  await cleanupOff?.();
+  // The plugin's own default is off: no tools, the prompt of a Lead that never edits, edits denied by the agent's
+  // own rules. `directWork: false` is the same.
+  for (const directWork of [undefined, false]) {
+    const off = createMockOpenCode({ directWork });
+    const cleanupOff = await plugin.setup(off.ctx);
+    assert.equal(off.tools.get("work_directly"), undefined);
+    assert.equal(off.tools.get("finish_direct"), undefined);
+    assert.match(off.agents.get("lead").system, /You never change files or run anything that has effects yourself/);
+    assert.doesNotMatch(off.agents.get("lead").system, /work_directly/);
+    assert.equal(resolvePermissionEffect(off.agents.get("lead").permissions, "edit"), "deny");
+    await cleanupOff?.();
+  }
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
@@ -1603,4 +1603,108 @@ test("16. Fusion mode: one more mode under a chosen name, a hidden Fellow, and s
 
   await Promise.all([cleanup?.(), cleanupRestarted?.(), cleanupSecond?.(), cleanupPinned?.(), cleanupOff?.()]);
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("17. Lead reads and Fellow acts: read-only shell for Lead, a small job handed over as one sentence", async () => {
+  const mock = createMockOpenCode({ directWork: undefined });
+  const cleanup = await plugin.setup(mock.ctx);
+  const before = mock.toolBeforeHooks[0];
+  const handoff = mock.tools.get("handoff_to_fellow");
+  const asLead = { sessionID: "ses_1", agent: "lead" };
+  let n = 0;
+  const shell = (command, agent = "lead") => before({ tool: "shell", agent, sessionID: "ses_1", id: `sh_${(n += 1)}`, messageID: `m_${n}`, input: { command } });
+
+  // Looking is open to Lead without anything being declared.
+  for (const command of [
+    "git log --oneline -5",
+    "git status",
+    'git log --all --since="3 months ago" -i --grep="rate\\|cut" --format="%h %ad %s" --date=short | head -40',
+    "git -C packages/core diff HEAD~1 --stat",
+    "git --no-pager show HEAD:package.json | head -20",
+    "git branch -a --list 'dev/*'",
+    "git branch --show-current",
+    "git tag -l",
+    "git remote -v",
+    "git stash list",
+    "git worktree list",
+    "git config --get user.name",
+    "ls -la src && cat package.json | wc -l",
+    "cd packages/app; ls",
+    "rg -n \"TODO|FIXME\" src 2>/dev/null | sort | uniq -c",
+    "grep -rn 'a > b' src",
+    "LC_ALL=C git log -1 2>&1",
+    "/usr/bin/git status",
+  ]) {
+    await shell(command);
+  }
+
+  // Anything with effects is refused, with the way on.
+  for (const command of [
+    "npm install",
+    "yarn typecheck",
+    "git switch main",
+    "git commit -m x",
+    "git push",
+    "git fetch",
+    "git branch feature/new",
+    "git branch -D old",
+    "git tag v1.0.0",
+    "git stash",
+    "git worktree remove ../other",
+    "git config user.name x",
+    "git -c core.pager=less log",
+    "git log --output=out.txt",
+    "git log > out.txt",
+    "git status; rm -rf build",
+    "git status && touch x",
+    "git status\nrm x",
+    "ls | xargs rm",
+    "cat a.txt | tee b.txt",
+    "echo hi > file.txt",
+    "echo $(rm x)",
+    "echo `rm x`",
+    "cat < secret",
+    "sort -o out.txt in.txt",
+    "uniq in.txt out.txt",
+    "rg --pre ./run.sh pattern",
+    "sed -i s/a/b/ file",
+    "find . -delete",
+    "yarn dev &",
+    "node script.js",
+    "",
+    "   ",
+  ]) {
+    await assert.rejects(() => shell(command), /read-only commands only/, `expected a refusal for: ${command}`);
+  }
+  await assert.rejects(() => shell("npm test"), /Hand it to Fellow with handoff_to_fellow; for a small job give only `summary`/);
+  await assert.rejects(() => shell("npm test"), (err) => !/work_directly/.test(err.message));
+
+  // A small job is its summary and nothing else.
+  await assert.rejects(() => handoff.execute({ summary: "  " }, asLead), /requires a non-empty summary/);
+  const small = await handoff.execute({ summary: "Run `yarn deploy:alpha` in apps/web and report the deployment id." }, asLead);
+  assert.match(small.content, /FELLOW MODE ACTIVE/);
+  const plan = mock.storage.get("fusion:ses_1").activePlan;
+  assert.equal(plan.summary, "Run `yarn deploy:alpha` in apps/web and report the deployment id.");
+  assert.deepEqual(plan.steps, [plan.summary]);
+  assert.deepEqual(plan.files, []);
+  assert.deepEqual(plan.requirements, []);
+  assert.deepEqual(plan.checks, []);
+  assert.deepEqual(plan.phases, []);
+  assert.match(mock.agents.get("fellow").system, /A plan that is only a `summary` is a small job/);
+  assert.match(mock.agents.get("lead").system, /A handoff comes in two sizes/);
+
+  // Fellow keeps its whole shell.
+  await shell("npm install", "fellow");
+  await cleanup?.();
+
+  // With direct work on, the refusal also names the window, and inside a window the shell is whole.
+  const direct = createMockOpenCode({ directWork: true });
+  const cleanupDirect = await plugin.setup(direct.ctx);
+  const beforeDirect = direct.toolBeforeHooks[0];
+  await beforeDirect({ tool: "shell", agent: "lead", sessionID: "ses_1", id: "d1", messageID: "dm1", input: { command: "git status" } });
+  await assert.rejects(
+    () => beforeDirect({ tool: "shell", agent: "lead", sessionID: "ses_1", id: "d2", messageID: "dm2", input: { command: "npm test" } }),
+    /call work_directly first/,
+  );
+  await cleanupDirect?.();
 });

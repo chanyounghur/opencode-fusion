@@ -196,17 +196,15 @@ test("real opencode serve: the mode and its agents, settings, role switching, >>
 
     // The Lead starts from "deny everything" and gets reading, planning and handing off.
     assert.deepEqual(lead.permissions[0], { action: "*", resource: "*", effect: "deny" });
-    for (const denied of ["subagent", "execute", "handoff_to_lead", "opencode_worktree_create", "opencode_session_move", "artifact_write"]) {
+    for (const denied of ["edit", "write", "work_directly", "subagent", "execute", "handoff_to_lead", "opencode_worktree_create", "opencode_session_move", "artifact_write"]) {
       assert.equal(lastRuleEffect(lead.permissions, denied), "deny", `expected the Lead to be denied ${denied}`);
     }
     for (const allowed of ["read", "glob", "grep", "handoff_to_fellow", "opencode_session_read"]) {
       assert.equal(lastRuleEffect(lead.permissions, allowed), "allow", `expected the Lead to be allowed ${allowed}`);
     }
-    // Direct work is on by default: the editing tools pass the agent's rules and are held back per call, outside an
-    // open `work_directly` window, by the plugin's own check.
-    for (const gated of ["edit", "shell", "work_directly", "finish_direct"]) {
-      assert.equal(lastRuleEffect(lead.permissions, gated), "allow", `expected the Lead to be allowed ${gated} (held back per call)`);
-    }
+    // The shell passes the agent's rules; each call is held to read-only commands by the plugin's own check.
+    assert.equal(lastRuleEffect(lead.permissions, "shell"), "allow");
+    assert.match(lead.system ?? "", /A handoff comes in two sizes/);
 
     // 3. Settings: nothing chosen, nothing fixed by the configuration.
     const settings = await rpc(server, "getSettings", {});

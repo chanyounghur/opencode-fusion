@@ -27,7 +27,9 @@
  * - Phases and checkpoints: Lead divides the work, Fellow reports at each checkpoint (`report_checkpoint`),
  *   the plugin runs that phase's checks and wakes Lead only when something calls for it; Lead answers with
  *   `resume_fellow` (continue / adjust) instead of writing a whole new plan
- * - Direct work (on by default, `directWork: false` switches it off): Lead may make a small, certain change itself instead of handing off.
+ * - Lead reads, plans and reviews; Fellow does every edit and every command with effects. Lead's shell is limited to
+ *   read-only commands (git log, ls, grep …). A small job is handed over with nothing but a `summary`.
+ * - Direct work (off by default, `directWork: true` switches it on): Lead may make a small, certain change itself instead of handing off.
  *   `work_directly` opens editing and shell inside a budget (files, changed lines, steps), `finish_direct` runs the
  *   checks and closes it. Past the budget edits are refused and the rest goes to Fellow. Also used for a small
  *   correction after Fellow returns.
@@ -163,7 +165,7 @@ interface PluginOptions {
   maxStalledReturns?: number;
   // Changed files outside the plan's `files` (and their folders) beyond this number wake Lead at a checkpoint.
   offPlanFilesLimit?: number;
-  // Lead may make small changes itself (`work_directly`). On by default; false keeps Lead read-only.
+  // true lets Lead make small changes itself (`work_directly`). Off by default: Lead reads, plans and reviews.
   directWork?: boolean;
   // The budget of direct work per user turn, and per window for steps.
   maxDirectFiles?: number;
@@ -311,6 +313,139 @@ const FORBIDDEN_EXTRA_LEAD_TOOLS = new Set([
   "experimental_video_generate",
 ]);
 
+// What Lead may run in the shell without Fellow: commands that only look. This keeps Lead from doing the work itself;
+// it is not a sandbox (Lead can already read every file), so the list blocks the plain ways of changing things and
+// does not chase every flag of every tool.
+const READ_ONLY_COMMANDS = new Set([
+  "ls", "dir", "pwd", "cd", "cat", "type", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "nl", "column",
+  "file", "stat", "du", "tree", "which", "where", "echo", "true", "basename", "dirname", "realpath",
+  "grep", "rg", "egrep", "fgrep", "findstr", "diff", "cmp", "jq",
+]);
+const READ_ONLY_GIT = new Set([
+  "log", "show", "status", "diff", "blame", "rev-parse", "rev-list", "ls-files", "ls-tree", "ls-remote", "describe",
+  "shortlog", "cat-file", "merge-base", "name-rev", "for-each-ref", "show-ref", "show-branch", "grep", "whatchanged",
+  "diff-tree", "count-objects", "version", "help",
+]);
+const GIT_LISTING_FLAG = /^(-a|-r|-l|-v|-vv|-n\d*|--all|--remotes|--list|--show-current|--verbose|--contains|--no-contains|--merged|--no-merged|--points-at|--sort|--format|--column|--no-column)(=|$)/;
+
+/** A command line cut into its commands (at `|`, `&&`, `||`, `;`, new lines), each as its words. undefined: something this cannot vouch for. */
+function splitShellCommands(command: string): string[][] | undefined {
+  const commands: string[][] = [];
+  let words: string[] = [];
+  let word = "";
+  let inWord = false;
+  let quote: string | undefined;
+  const endWord = () => {
+    if (inWord) words.push(word);
+    word = "";
+    inWord = false;
+  };
+  const endCommand = () => {
+    endWord();
+    if (words.length > 0) commands.push(words);
+    words = [];
+  };
+  for (let i = 0; i < command.length; i += 1) {
+    const ch = command[i];
+    const next = command[i + 1];
+    if (quote) {
+      if (ch === quote) quote = undefined;
+      else if (quote === '"' && (ch === "`" || (ch === "$" && next === "("))) return undefined;
+      else if (quote === '"' && ch === "\\" && next !== undefined) {
+        word += next;
+        i += 1;
+      } else word += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      inWord = true;
+    } else if (ch === "\\" && next !== undefined) {
+      word += next;
+      inWord = true;
+      i += 1;
+    } else if (ch === "`" || ch === "<" || (ch === "$" && next === "(")) {
+      return undefined;
+    } else if (ch === ">") {
+      // Only throwing output away or joining the two streams; anything else writes a file.
+      const sink = /^>\s*(&1|&2|\/dev\/null|nul)(?=[\s|;&]|$)/i.exec(command.slice(i));
+      if (!sink) return undefined;
+      if (/^[12]$/.test(word)) {
+        word = "";
+        inWord = false;
+      } else endWord();
+      i += sink[0].length - 1;
+    } else if (ch === "|" || ch === ";" || ch === "\n" || ch === "&") {
+      // A single `&` would leave the command running in the background.
+      if (ch === "&" && next !== "&") return undefined;
+      if (ch === "&" || (ch === "|" && next === "|")) i += 1;
+      endCommand();
+    } else if (ch === " " || ch === "\t" || ch === "\r") {
+      endWord();
+    } else {
+      word += ch;
+      inWord = true;
+    }
+  }
+  if (quote) return undefined;
+  endCommand();
+  return commands;
+}
+
+function isReadOnlyGit(args: string[]): boolean {
+  let i = 0;
+  while (i < args.length && args[i].startsWith("-")) {
+    const flag = args[i];
+    if (flag === "-C" || flag === "--git-dir" || flag === "--work-tree") i += 2;
+    else if (flag === "--no-pager" || flag === "-P" || flag === "--no-optional-locks" || /^--(git-dir|work-tree)=/.test(flag)) i += 1;
+    // `-c` can name a program to run; anything else before the subcommand is not worth guessing at.
+    else return false;
+  }
+  const sub = args[i];
+  if (!sub) return false;
+  const rest = args.slice(i + 1);
+  if (rest.some((arg) => arg === "--output" || arg.startsWith("--output=") || arg === "-O" || arg.startsWith("--open-files-in-pager"))) return false;
+  if (READ_ONLY_GIT.has(sub)) return true;
+  const positional = rest.filter((arg) => !arg.startsWith("-"));
+  const flags = rest.filter((arg) => arg.startsWith("-"));
+  const onlyListing = flags.every((flag) => GIT_LISTING_FLAG.test(flag));
+  // Without a listing flag, a name after `branch` or `tag` creates one.
+  if (sub === "branch" || sub === "tag") return onlyListing && (positional.length === 0 || flags.length > 0);
+  if (sub === "remote") return rest.length === 0 || (flags.length === rest.length && onlyListing) || positional[0] === "show" || positional[0] === "get-url";
+  if (sub === "stash") return positional[0] === "list" || positional[0] === "show";
+  if (sub === "worktree") return positional[0] === "list";
+  if (sub === "reflog") return positional.length === 0 || positional[0] === "show";
+  if (sub === "config") return flags.some((flag) => /^(--get|--get-all|--get-regexp|--list|-l)$/.test(flag)) && !flags.some((flag) => /^(--add|--unset|--unset-all|--replace-all|--edit|-e|--rename-section|--remove-section)$/.test(flag));
+  return false;
+}
+
+/** true when every command on the line only looks at things. */
+function isReadOnlyShell(command: string): boolean {
+  if (!command.trim()) return false;
+  const commands = splitShellCommands(command);
+  if (!commands || commands.length === 0) return false;
+  return commands.every((words) => {
+    let i = 0;
+    while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i])) i += 1;
+    if (i >= words.length) return true;
+    const name = words[i].replace(/\\/g, "/").split("/").pop()!.toLowerCase().replace(/\.exe$/, "");
+    const args = words.slice(i + 1);
+    if (name === "git") return isReadOnlyGit(args);
+    if (!READ_ONLY_COMMANDS.has(name)) return false;
+    // The few listed tools that can write or run something when asked to.
+    if ((name === "sort" || name === "tree") && args.some((arg) => arg === "-o" || arg.startsWith("--output"))) return false;
+    if (name === "uniq" && args.filter((arg) => !arg.startsWith("-")).length > 1) return false;
+    if (name === "rg" && args.some((arg) => arg === "--pre" || arg.startsWith("--pre="))) return false;
+    return true;
+  });
+}
+
+function rawShellCommand(input: unknown): string {
+  if (!input || typeof input !== "object") return "";
+  const raw = input as Record<string, unknown>;
+  return typeof raw.command === "string" ? raw.command : typeof raw.cmd === "string" ? raw.cmd : "";
+}
+
 const BENIGN_EXIT_ONE_COMMANDS = new Set([
   "grep",
   "rg",
@@ -322,10 +457,10 @@ const BENIGN_EXIT_ONE_COMMANDS = new Set([
 ]);
 
 const LEAD_PROMPT = [
-  "You are the Fusion LEAD in a strict read-only architectural and review role.",
-  "- Inspect the codebase and requirements using only read-only tools (read, glob, grep, webfetch, websearch, question, skill, session read/search, worktree list).",
-  "- Never attempt mutating edits, shells, subagents, Code Mode execute, or worktree/session mutations — they are strictly disabled in Lead mode.",
-  "- When ready for implementation or fixes, call `handoff_to_fellow` with concrete `summary`, target `files`, ordered `steps`, `verification` notes, and explicit `replanIf` stop conditions.",
+  "You are the Fusion LEAD: you read, decide how the work gets done, and review the result. You are the stronger and dearer model; Fellow is the cheaper one that does all the editing and all the running. You never change files or run anything that has effects yourself.",
+  "- Inspect with read-only tools (read, glob, grep, webfetch, websearch, question, skill, session read/search, worktree list) and read-only shell commands (git log / status / diff / show / blame / branch --list, ls, cat, head, tail, wc, grep, rg, and pipes between them). Any other shell command is refused.",
+  "- Everything else goes to Fellow through `handoff_to_fellow`, however small: edits, installs, builds, tests, dev servers, screenshots, commits, pushes, deploys, pull requests, and lookups that need tools you do not have (Code Mode `execute`, MCP tools such as chat or design search). Never attempt edits, subagents, Code Mode execute, or worktree/session mutations yourself. Do not do a job in pieces through your own tools to avoid a handoff: every step you take rereads the whole conversation at your price.",
+  "- A handoff comes in two sizes. Small job (a command or two to run and report, a change of a few lines that you can state exactly, a lookup): give only `summary` — what to do and what to report back, in one to three sentences — plus `checks` when a command can confirm it. Write no steps, files or requirements for a small job. Larger work: give `summary`, target `files`, ordered `steps`, `requirements`, `checks`, `verification` notes and explicit `replanIf` stop conditions.",
   "- `requirements`: list every distinct thing the user asked for, one item each, close to the user's own words. Include asides and half-stated wishes (\"…도 두고\", \"while you're at it\"). When a phrase can be read two ways, keep it and add your reading in parentheses; never drop a request because it is vague. Every item needs a step that delivers it.",
   "- `checks`: the commands Fusion itself runs when Fellow reports completion (type check or build, and the relevant tests). Each entry is one bare command with an optional `cwd` relative to the project root: no commentary, no `cd`, exit code 0 means pass. If dependencies are missing, add a step that installs them rather than leaving a check out. Failing checks go back to Fellow without waking you.",
   "- For each new behaviour that no existing test covers (especially failure paths), include a step that adds a test for it.",
@@ -338,7 +473,7 @@ const LEAD_PROMPT = [
   "- Do not conclude while a check is failing or could not run if another handoff can fix it (missing dependencies, a wrong command). When you do hand off again, put every remaining issue into that one handoff. If something truly cannot be verified here, tell the user exactly what was not verified.",
 ].join("\n");
 
-/** Lead's prompt when it may also work on the code itself. The first three lines (read-only role) are replaced. */
+/** Lead's prompt when it may also work on the code itself (`directWork: true`). The first three lines (Lead never edits) are replaced. */
 function leadPromptFor(direct: boolean, limits: { files: number; lines: number }): string {
   if (!direct) return LEAD_PROMPT;
   const rest = LEAD_PROMPT.split("\n")
@@ -346,7 +481,7 @@ function leadPromptFor(direct: boolean, limits: { files: number; lines: number }
     .map((line) => line.replace("or issue a revised `handoff_to_fellow`.", "issue a revised `handoff_to_fellow`, or fix a small thing yourself with `work_directly`."));
   return [
     "You are the Fusion LEAD: you read the code, decide how the work gets done, and review the result. You are the stronger and dearer model; Fellow is the cheaper one that does the long stretches of editing.",
-    "- Start by reading (read, glob, grep, webfetch, websearch, skill, session read/search). Reading is always open to you. Editing and shell are closed until you call `work_directly`.",
+    "- Start by reading (read, glob, grep, webfetch, websearch, skill, session read/search, and read-only shell commands such as git log / status / diff, ls, cat, grep). Reading is always open to you. Editing and every other shell command are closed until you call `work_directly`.",
     "- Then choose how the work gets done. A handoff costs a written plan, a model switch and Fellow reading again what you already read, so it only pays when there is real work to hand over. Doing long work yourself spends your tokens on every line.",
     `  - \`work_directly\` (you do it yourself): when, after reading, you already know exactly what to change, it comes to a few places (at most about ${limits.files} files and ${limits.lines} changed lines, tests included), nothing in it is a design decision that could turn out wrong, and a check can confirm it. Also when the task only asks for something written down (a review, a note, an answer in a file). Also for a small correction after Fellow returns (a wrong condition, a missed line, a forgotten file) instead of another handoff.`,
     "  - `handoff_to_fellow`: everything else. Work spread over many files, new modules, anything you would have to explore while writing. When you cannot tell which it is, hand off.",
@@ -359,6 +494,7 @@ function leadPromptFor(direct: boolean, limits: { files: number; lines: number }
 const FELLOW_PROMPT = [
   "You are the Fusion FELLOW responsible for focused implementation and verification.",
   "- Follow the active `fusion.plan` in instructions strictly; make clean, minimal edits and run the specified `verification` commands.",
+  "- A plan that is only a `summary` is a small job: do exactly what it says and nothing more, then hand back with what you did or found. Quote the part of a command's output that answers the question; Lead does not see your tool results, only your hand-back.",
   "- Respect `replanIf` stop conditions and avoid blind retries after repeated failures.",
   "- You MUST finish every execution turn by calling `handoff_to_lead` (`completed`, `blocked`, or `need_replan`) with a concise summary, `changedFiles`, `verification`, and any `blockers` — never end a turn directly with plain text without handing back to Lead.",
   "- When the plan has `phases`, work on one phase at a time. When a phase is done, call `report_checkpoint` and wait for its answer before starting the next: it runs that phase's checks, and either tells you to go on or brings Lead in. The report has three places for remarks, and they are treated differently. `concerns`: a question or choice you need Lead to decide before going on. `deviations`: a departure from the plan that changes what gets built. Either of these brings Lead in, so use them when it matters and only then. `notes`: anything else worth knowing, such as what you could not verify in this environment or a small incidental fix; these are recorded for Lead without interrupting. Do not hide a real doubt in `notes`: a wrong turn carried through three phases costs the whole task. `amendments` in the plan are Lead's later corrections and override the original steps.",
@@ -1128,8 +1264,8 @@ export default {
     const checkTimeoutMs = normalizePositiveInt(rawOptions.checkTimeoutSeconds, DEFAULT_CHECK_TIMEOUT_SECONDS) * 1000;
     const maxStalledReturns = normalizePositiveInt(rawOptions.maxStalledReturns, DEFAULT_MAX_STALLED_RETURNS);
     const offPlanFilesLimit = normalizePositiveInt(rawOptions.offPlanFilesLimit, DEFAULT_OFF_PLAN_FILES_LIMIT);
-    // On unless switched off (`directWork: false` gives the loop where Lead only reads and plans).
-    const directEnabled = rawOptions.directWork !== false;
+    // Off unless switched on: Lead reads, plans and reviews, and Fellow does the editing and running.
+    const directEnabled = rawOptions.directWork === true;
     const maxDirectFiles = normalizePositiveInt(rawOptions.maxDirectFiles, DEFAULT_MAX_DIRECT_FILES);
     const maxDirectLines = normalizePositiveInt(rawOptions.maxDirectLines, DEFAULT_MAX_DIRECT_LINES);
     const maxDirectSteps = normalizePositiveInt(rawOptions.maxDirectSteps, DEFAULT_MAX_DIRECT_STEPS);
@@ -1142,9 +1278,10 @@ export default {
       ...sanitizeExtraLeadTools(rawOptions.extraLeadTools),
       ...(directEnabled ? ["work_directly", "finish_direct"] : []),
     ]);
-    // The agent's own rules must let the editing tools through; whether one may run right now is decided per call,
-    // in `execute.before` (only inside an open direct window and inside the budget).
-    const leadPermissionTools = directEnabled ? new Set<string>([...leadAllowedTools, ...DIRECT_TOOLS]) : leadAllowedTools;
+    // The agent's own rules must let these tools through; whether a call may run is decided per call, in
+    // `execute.before`: the shell for read-only commands, the editing tools only inside an open direct window and
+    // inside the budget.
+    const leadPermissionTools = new Set<string>([...leadAllowedTools, "shell", ...(directEnabled ? DIRECT_TOOLS : [])]);
 
     const sessionLocks = new Map<string, Promise<void>>();
     const inFlightCallEpoch = new Map<string, number>();
@@ -1540,12 +1677,12 @@ export default {
       editor.add({
         name: "handoff_to_fellow",
         description:
-          "Lead-only tool. Transfers the single session context and structured implementation plan to the Fellow agent and its model.",
+          "Lead-only tool. Hands work to the Fellow agent and its model, in the same session. Small job: `summary` alone (what to do and what to report back), plus `checks` if a command can confirm it. Larger work: the whole plan.",
         options: { codemode: false },
         input: {
           type: "object",
           properties: {
-            summary: { type: "string", description: "Short summary of the objective and approach." },
+            summary: { type: "string", description: "The objective and approach. For a small job this is the whole instruction: what to do and what to report back, in one to three sentences." },
             files: {
               type: "array",
               items: { type: "string" },
@@ -1611,7 +1748,7 @@ export default {
                 "Commands Fusion runs itself when Fellow reports completion (type check or build, tests). Failing ones go back to Fellow.",
             },
           },
-          required: ["summary", "files", "verification", "replanIf", "requirements"],
+          required: ["summary"],
           additionalProperties: false,
         },
         async execute(args: any, toolCtx: any) {
@@ -1649,9 +1786,10 @@ export default {
             const phases = sanitizePhases(args?.phases);
             // A divided plan carries its steps inside the phases; the flat list is kept for older readers.
             if (steps.length === 0 && phases.length > 0) steps.push(...phases.flatMap((phase) => phase.steps));
-            if (!summary || steps.length === 0) {
-              throw new Error("handoff_to_fellow requires a non-empty summary and at least one step (in `steps` or inside `phases`).");
-            }
+            if (!summary) throw new Error("handoff_to_fellow requires a non-empty summary.");
+            // A small job is its summary and nothing else.
+            const smallJob = steps.length === 0;
+            if (smallJob) steps.push(summary);
 
             const plan: ActivePlan = {
               summary,
@@ -2288,6 +2426,18 @@ export default {
 
         if (event.agent === AGENT.lead) {
           const isDirectTool = directEnabled && DIRECT_TOOLS.has(event.tool);
+          if (event.tool === "shell" && !state.direct) {
+            // Looking is always open to Lead; a command with effects is Fellow's (or, with direct work, a window's).
+            const command = rawShellCommand(event.input);
+            if (state.role !== "lead") throw new Error("shell is only available in Lead mode.");
+            if (!isReadOnlyShell(command)) {
+              throw new Error(
+                `Lead runs read-only commands only (git log / status / diff / show / blame, ls, cat, head, tail, wc, grep, rg, and pipes between them). This one is not: ${command.replace(/\s+/g, " ").trim().slice(0, 120)}. Hand it to Fellow with handoff_to_fellow; for a small job give only \`summary\` (what to run or change, and what to report back).${directEnabled ? " Or, for a small change you will make yourself, call work_directly first." : ""}`,
+              );
+            }
+            if (event?.id) inFlightCallEpoch.set(callKey(sessionID, String(event.id)), state.epoch);
+            return;
+          }
           if (!leadAllowedTools.has(event.tool) && !isDirectTool) {
             throw new Error(
               `Tool "${event.tool}" is disabled in Lead mode (strict PLAN allowlist). Use read-only tools or call handoff_to_fellow first.`,
