@@ -116,6 +116,9 @@ interface FusionState {
   lastWorkHash?: string;
   // The epoch in which Fellow was already asked once to hand back properly after stopping without a tool call.
   idleNudgeEpoch?: number;
+  // A command the risk gate stopped, waiting for the user's `/fusion-approve`; and the one approval not yet used.
+  pendingRisk?: { key: string; command: string; what: string };
+  approvedRisk?: string;
   // Which phase Fellow is on (0-based), and how often its checkpoint was sent back by failing checks.
   phaseIndex: number;
   phaseBounces: number;
@@ -707,7 +710,10 @@ function buildScoutPermissions(existingRules: PermissionRule[] = []): Permission
   return rules;
 }
 
-/** Why the scout may not run this command, or undefined when it may. Looking is open; changing the repository is not. */
+/**
+ * Why this command counts as changing the project, or undefined when it does not. Used for the scout's shell and for
+ * the plan's checks: both may look and run things, neither may commit, delete or install.
+ */
 function scoutShellRefusal(command: string): string | undefined {
   if (!command.trim()) return "An empty command.";
   const commands = splitShellCommands(command.replace(/>\s*("[^"]*"|'[^']*'|[^\s|;&]+)/g, " "), false);
@@ -724,6 +730,133 @@ function scoutShellRefusal(command: string): string | undefined {
     if (SCOUT_REFUSED_COMMANDS.has(name)) return `\`${name}\` changes files or installs things.`;
     if ((name === "npm" || name === "pnpm" || name === "yarn" || name === "bun" || name === "pip" || name === "pip3") && /^(i|install|add|remove|uninstall|update|upgrade|publish|link|ci)$/.test(args.find((arg) => !arg.startsWith("-")) ?? "")) {
       return `\`${name} ${args[0] ?? ""}\` installs or removes packages.`;
+    }
+  }
+  return undefined;
+}
+
+/** A command that would lose work as the repository stands now. `key` names the operation and its target, so one approval covers one thing. */
+interface Risk {
+  key: string;
+  what: string;
+}
+
+/**
+ * Looks at a command line Fellow is about to run and says whether it would lose work: commits that are on no other
+ * branch and no remote, uncommitted changes, untracked files, or history on a remote. The judgement is made against
+ * the repository as it is at this moment, not against the wording of the plan. Anything it cannot read is let through:
+ * this stops the plain cases, it is not a sandbox.
+ */
+function findRisk(command: string, root: string): Risk | undefined {
+  const stripped = command.replace(/\d?>>?\s*("[^"]*"|'[^']*'|[^\s|;&]+)/g, " ");
+  const lines = splitShellCommands(stripped, false) ?? [stripped.trim().split(/\s+/)];
+  let cwd = root;
+  for (const words of lines) {
+    let i = 0;
+    while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i])) i += 1;
+    const name = (words[i] ?? "").replace(/\\/g, "/").split("/").pop()!.toLowerCase().replace(/\.exe$/, "");
+    const args = words.slice(i + 1);
+    if (name === "cd" && args[0]) {
+      cwd = nodePath.resolve(cwd, args[0]);
+      continue;
+    }
+    if (name !== "git") continue;
+    let dir = cwd;
+    let j = 0;
+    while (j < args.length && args[j].startsWith("-")) {
+      if (args[j] === "-C") {
+        dir = nodePath.resolve(dir, args[j + 1] ?? ".");
+        j += 2;
+      } else if (args[j] === "-c" || args[j] === "--git-dir" || args[j] === "--work-tree") j += 2;
+      else j += 1;
+    }
+    const sub = args[j];
+    const rest = args.slice(j + 1);
+    const flags = rest.filter((arg) => arg.startsWith("-"));
+    const names = rest.filter((arg) => !arg.startsWith("-"));
+    const git = (...gitArgs: string[]) => spawnSync("git", ["-C", dir, ...gitArgs], { encoding: "utf8", windowsHide: true, timeout: 15_000, maxBuffer: 8 * 1024 * 1024 });
+    const text = (...gitArgs: string[]) => {
+      const out = git(...gitArgs);
+      return out.status === 0 && typeof out.stdout === "string" ? out.stdout.trim() : "";
+    };
+    const exists = (ref: string) => git("rev-parse", "--verify", "--quiet", ref).status === 0;
+    // Commits reachable from `ref` that are neither under `keep` nor on any remote-tracking branch.
+    // A `keep` that does not exist yet (a ref an earlier command on the same line will fetch) is left out, so the
+    // judgement is then made against the remotes as they are known now.
+    const onlyHere = (ref: string, keep: string) => {
+      const listed = text("log", "--oneline", "-n", "40", ref, "--not", ...(exists(keep) ? [keep] : []), "--remotes");
+      return listed ? listed.split("\n") : [];
+    };
+    const sample = (rows: string[]) => `${rows.slice(0, 3).join(" | ")}${rows.length > 3 ? ` | … ${rows.length - 3} more` : ""}`;
+
+    if (sub === "checkout" || sub === "switch" || sub === "branch") {
+      // Moving an existing branch somewhere else: `checkout -B`, `switch -C`, `branch -f`.
+      const forceFlag = sub === "checkout" ? ["-B"] : sub === "switch" ? ["-C", "--force-create"] : ["-f", "--force"];
+      const at = rest.findIndex((arg) => forceFlag.includes(arg));
+      if (at >= 0 && !(sub === "branch" && flags.some((flag) => /^(-d|-D|--delete|-m|-M|--move)$/.test(flag)))) {
+        const after = rest.slice(at + 1).filter((arg) => !arg.startsWith("-"));
+        const branch = sub === "branch" ? names[0] : after[0];
+        const start = (sub === "branch" ? names[1] : after[1]) ?? "HEAD";
+        if (branch && exists(`refs/heads/${branch}`)) {
+          const lost = onlyHere(`refs/heads/${branch}`, start);
+          if (lost.length > 0) {
+            return {
+              key: `move-branch:${branch}`,
+              what: `It moves the existing local branch \`${branch}\` to \`${start}\`. ${lost.length}${lost.length === 40 ? "+" : ""} commit(s) on it are on no remote and would be left on no branch: ${sample(lost)}.`,
+            };
+          }
+        }
+      }
+      if (sub === "branch" && flags.some((flag) => flag === "-D" || flag === "--force") && flags.some((flag) => /^(-d|-D|--delete)$/.test(flag))) {
+        for (const branch of names) {
+          if (!exists(`refs/heads/${branch}`)) continue;
+          const lost = onlyHere(`refs/heads/${branch}`, "HEAD");
+          if (lost.length > 0) {
+            return {
+              key: `delete-branch:${branch}`,
+              what: `It deletes the local branch \`${branch}\`, which has ${lost.length}${lost.length === 40 ? "+" : ""} commit(s) that are neither merged here nor on any remote: ${sample(lost)}.`,
+            };
+          }
+        }
+      }
+    }
+    if (sub === "reset" && flags.includes("--hard")) {
+      const dirty = text("status", "--porcelain", "--untracked-files=no").split("\n").filter(Boolean);
+      const target = names[0] ?? "HEAD";
+      const lost = target === "HEAD" ? [] : onlyHere("HEAD", target);
+      if (dirty.length > 0 || lost.length > 0) {
+        return {
+          key: "reset-hard",
+          what: [
+            "It resets the working tree and the branch.",
+            dirty.length > 0 ? `${dirty.length} file(s) have uncommitted changes that would be gone: ${dirty.slice(0, 5).map((row) => row.trim().replace(/^\S+\s+/, "")).join(", ")}${dirty.length > 5 ? ", …" : ""}.` : "",
+            lost.length > 0 ? `${lost.length}${lost.length === 40 ? "+" : ""} commit(s) on this branch are on no remote and would be left on no branch: ${sample(lost)}.` : "",
+          ]
+            .filter(Boolean)
+            .join(" "),
+        };
+      }
+    }
+    if (sub === "clean" && flags.some((flag) => flag === "--force" || /^-[A-Za-z]*f/.test(flag)) && !flags.some((flag) => flag === "--dry-run" || /^-[A-Za-z]*n/.test(flag))) {
+      const doomed = text("clean", "-n", ...rest.filter((arg) => arg !== "--force").map((arg) => (/^-[A-Za-z]+$/.test(arg) ? arg.replace("f", "") : arg)).filter((arg) => arg !== "-"))
+        .split("\n")
+        .filter(Boolean);
+      if (doomed.length > 0) {
+        return {
+          key: "clean",
+          what: `It deletes ${doomed.length} untracked file(s) or folder(s) for good: ${doomed.slice(0, 5).map((row) => row.replace(/^Would remove /, "")).join(", ")}${doomed.length > 5 ? ", …" : ""}.`,
+        };
+      }
+    }
+    if (sub === "push") {
+      const forced = flags.some((flag) => flag === "-f" || flag === "--force" || flag.startsWith("--force-with-lease") || flag.startsWith("--force-if-includes") || flag === "--mirror" || flag === "--delete" || flag === "-d");
+      const refspec = names.slice(1).find((spec) => spec.startsWith("+") || spec.startsWith(":"));
+      if (forced || refspec) {
+        return {
+          key: `rewrite-remote:${names.join(" ") || "(default)"}`,
+          what: `It rewrites or deletes history on a remote (\`git push ${rest.join(" ")}\`), which others may already have.`,
+        };
+      }
     }
   }
   return undefined;
@@ -1465,6 +1598,10 @@ export default {
         stalledReturns: typeof data.stalledReturns === "number" && data.stalledReturns >= 0 ? data.stalledReturns : 0,
         ...(typeof data.lastWorkHash === "string" ? { lastWorkHash: data.lastWorkHash } : {}),
         ...(typeof data.idleNudgeEpoch === "number" ? { idleNudgeEpoch: data.idleNudgeEpoch } : {}),
+        ...(data.pendingRisk && typeof data.pendingRisk.key === "string"
+          ? { pendingRisk: { key: data.pendingRisk.key, command: String(data.pendingRisk.command ?? ""), what: String(data.pendingRisk.what ?? "") } }
+          : {}),
+        ...(typeof data.approvedRisk === "string" ? { approvedRisk: data.approvedRisk } : {}),
         phaseIndex: typeof data.phaseIndex === "number" && data.phaseIndex >= 0 ? data.phaseIndex : 0,
         phaseBounces: typeof data.phaseBounces === "number" && data.phaseBounces >= 0 ? data.phaseBounces : 0,
         ...(typeof data.awaitingCheckpoint === "number" ? { awaitingCheckpoint: data.awaitingCheckpoint } : {}),
@@ -1759,6 +1896,22 @@ export default {
             const requirements = sanitizeStringList(args?.requirements);
             const checks = sanitizeChecks(args?.checks);
             const phases = sanitizePhases(args?.phases);
+            // Nothing is dropped in silence: a list too long to run is sent back to be cut down.
+            const givenLists: unknown[] = [args?.checks, ...(Array.isArray(args?.phases) ? args.phases.map((phase: any) => phase?.checks) : [])];
+            const longest = Math.max(0, ...givenLists.map((list) => (Array.isArray(list) ? list.length : 0)));
+            const total = givenLists.reduce((sum: number, list) => sum + (Array.isArray(list) ? list.length : 0), 0);
+            if (longest > MAX_CHECKS || total > MAX_CHECKS * 2) {
+              throw new Error(
+                `Too many checks: at most ${MAX_CHECKS} in one list and ${MAX_CHECKS * 2} in the whole plan (got ${longest} in one list, ${total} in all). Keep the ones that say most, or combine several into one script.`,
+              );
+            }
+            // Fusion runs the checks itself, outside the tools' own permission rules, so a check may only verify.
+            for (const check of [...checks, ...phases.flatMap((phase) => phase.checks)]) {
+              const refusal = scoutShellRefusal(check.command) ?? (findRisk(check.command, await sessionRoot(sessionID)) ? "It would lose work." : undefined);
+              if (refusal) {
+                throw new Error(`A check only verifies; this one changes something: \`${check.command.slice(0, 120)}\`. ${refusal} Put it in \`steps\`, where Fellow runs it, and keep \`checks\` to commands that look and report.`);
+              }
+            }
             // A divided plan carries its steps inside the phases; the flat list is kept for older readers.
             if (steps.length === 0 && phases.length > 0) steps.push(...phases.flatMap((phase) => phase.steps));
             if (!summary) throw new Error("handoff_to_fellow requires a non-empty summary.");
@@ -2339,6 +2492,29 @@ export default {
             }
           }
 
+          if (event.tool === "shell") {
+            // The risk gate. Whatever the plan said, this is the moment the command would take effect.
+            const command = rawShellCommand(event.input);
+            const risk = findRisk(command, await sessionRoot(sessionID));
+            if (risk) {
+              if (state.approvedRisk === risk.key) {
+                const used: FusionState = { ...state, revision: state.revision + 1 };
+                delete used.approvedRisk;
+                delete used.pendingRisk;
+                await saveState(used, { emit: false });
+              } else {
+                await saveState({ ...state, pendingRisk: { key: risk.key, command: command.replace(/\s+/g, " ").trim().slice(0, 300), what: risk.what }, revision: state.revision + 1 }, { emit: false });
+                throw new Error(
+                  [
+                    "[FUSION RISK GATE] Not run: this command would lose work.",
+                    risk.what,
+                    "If the goal can be reached without losing it (a new branch or a worktree instead of moving an existing branch, a commit or a stash before a reset), do that instead.",
+                    "If it really has to be this command, do not try variations of it: call `handoff_to_lead` with `need_replan` and say exactly this. Only the user can allow it, by typing `/fusion-approve`.",
+                  ].join("\n"),
+                );
+              }
+            }
+          }
           if (event?.id) {
             inFlightCallEpoch.set(callKey(sessionID, String(event.id)), state.epoch);
           }
@@ -2634,6 +2810,36 @@ export default {
     });
 
     await ctx.command.transform((editor: any) => {
+      editor.add({
+        name: "fusion-approve",
+        description: "Allow, once, the command the risk gate stopped",
+        async execute(input: any) {
+          const sessionID = input?.sessionID;
+          if (!sessionID) return;
+          await withSessionLock(sessionID, async () => {
+            const state = await loadState(sessionID);
+            const pending = state.pendingRisk;
+            if (!pending) {
+              await ctx.session.synthetic({ sessionID, text: "[FUSION] Nothing is waiting for approval.", delivery: input?.delivery ?? "steer", resume: false });
+              return;
+            }
+            const next: FusionState = { ...state, approvedRisk: pending.key, revision: state.revision + 1 };
+            delete next.pendingRisk;
+            await saveState(next);
+            await ctx.session.synthetic({
+              sessionID,
+              text: [
+                "[FUSION: THE USER APPROVED A STOPPED COMMAND]",
+                `Command: ${pending.command}`,
+                pending.what,
+                "The user allowed this once, knowing the above. It may be run now; the approval is used up by that one run and covers nothing else.",
+              ].join("\n"),
+              delivery: input?.delivery ?? "steer",
+              resume: true,
+            });
+          });
+        },
+      });
       editor.add({
         name: "fusion-status",
         description: "Show who is working now, the plan and the models",

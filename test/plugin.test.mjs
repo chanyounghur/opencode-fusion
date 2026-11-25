@@ -1642,3 +1642,112 @@ test("18. the scout: lookups run in a child session through the host's subagent 
 
   await cleanup?.();
 });
+
+test("19. the risk gate: a command that would lose work is stopped when Fellow runs it, judged against the repository as it is", async () => {
+  const dir = tempProject();
+  const git = (...args) => execFileSync("git", ["-C", dir, ...args], { stdio: "ignore" });
+  const main = execFileSync("git", ["-C", dir, "branch", "--show-current"], { encoding: "utf8" }).trim();
+  // A local branch with two commits that exist nowhere else, as in the case this gate was built for.
+  git("checkout", "--quiet", "-b", "alpha");
+  for (const n of [1, 2]) {
+    fs.writeFileSync(path.join(dir, `alpha${n}.txt`), `${n}\n`);
+    git("add", "-A");
+    git("commit", "--quiet", "-m", `alpha work ${n}`);
+  }
+  git("checkout", "--quiet", main);
+  fs.mkdirSync(path.join(dir, "sub"));
+  fs.writeFileSync(path.join(dir, "sub", "keep.txt"), "x\n");
+  git("add", "-A");
+  git("commit", "--quiet", "-m", "sub");
+
+  const mock = createMockOpenCode({ maxConsecutiveFailures: 99 });
+  const cleanup = await plugin.setup(mock.ctx);
+  mock.sessions.get("ses_1").location = { directory: dir };
+  const before = mock.toolBeforeHooks[0];
+  const toFellow = mock.tools.get("handoff_to_fellow");
+  await toFellow.execute({ summary: "Stack the fix on alpha and push it." }, { sessionID: "ses_1", agent: "lead" });
+  let n = 0;
+  const run = (command) => before({ tool: "shell", agent: "fellow", sessionID: "ses_1", id: `g_${(n += 1)}`, messageID: `gm_${n}`, input: { command } });
+  const state = () => mock.storage.get("fusion:ses_1");
+
+  // Moving an existing branch that holds commits found nowhere else.
+  await assert.rejects(() => run(`git checkout -B alpha ${main}`), (err) => {
+    assert.match(err.message, /\[FUSION RISK GATE\] Not run/);
+    assert.match(err.message, /moves the existing local branch `alpha`/);
+    assert.match(err.message, /2 commit\(s\) on it are on no remote/);
+    assert.match(err.message, /alpha work 2/);
+    assert.match(err.message, /a new branch or a worktree/);
+    assert.match(err.message, /Only the user can allow it, by typing `\/fusion-approve`/);
+    return true;
+  });
+  assert.equal(state().pendingRisk.key, "move-branch:alpha");
+  await assert.rejects(() => run("git switch -C alpha"), /RISK GATE/);
+  await assert.rejects(() => run(`git branch -f alpha ${main}`), /RISK GATE/);
+  await assert.rejects(() => run("cd sub && git -C .. checkout -B alpha"), /RISK GATE/);
+  await assert.rejects(() => run("git fetch origin; git checkout -B alpha origin/alpha 2>&1 | tail -3"), /RISK GATE/);
+  await assert.rejects(() => run("git branch -D alpha"), /deletes the local branch `alpha`, which has 2 commit/);
+
+  // The same commands where nothing would be lost are not the gate's business.
+  for (const command of [
+    "git checkout -b alpha-fix",              // a new branch
+    "git checkout -B fresh",                  // -B on a name that does not exist yet
+    "git checkout -B alpha alpha",            // moved to where it already is
+    "git checkout alpha",
+    "git branch -d alpha",                    // git itself refuses this one when unmerged
+    "git reset --hard",                       // nothing uncommitted
+    "git clean -n",
+    "git clean -fd",                          // nothing untracked
+    `git push origin ${main}`,
+    "git push --set-upstream origin alpha-fix",
+    "yarn test && git status",
+  ]) {
+    await run(command);
+  }
+
+  // Uncommitted changes and unpushed commits under a hard reset.
+  fs.writeFileSync(path.join(dir, "a.txt"), "edited\n");
+  await assert.rejects(() => run("git reset --hard"), /1 file\(s\) have uncommitted changes that would be gone: a\.txt/);
+  git("checkout", "--", "a.txt");
+  await assert.rejects(() => run("git reset --hard HEAD~1"), /1 commit\(s\) on this branch are on no remote/);
+
+  // Untracked files under a clean.
+  fs.writeFileSync(path.join(dir, "notes.txt"), "mine\n");
+  await assert.rejects(() => run("git clean -fd"), /deletes 1 untracked file\(s\) or folder\(s\) for good: notes\.txt/);
+  await run("git clean -nd");
+
+  // History on a remote.
+  for (const command of [`git push --force origin ${main}`, `git push -f`, `git push --force-with-lease origin ${main}`, "git push origin :old-branch", `git push origin +${main}`, "git push --delete origin old-branch"]) {
+    await assert.rejects(() => run(command), /rewrites or deletes history on a remote/, `expected the gate for: ${command}`);
+  }
+
+  // Only the user lifts it, once, for that one operation.
+  const approve = mock.commands.get("fusion-approve");
+  await assert.rejects(() => run(`git checkout -B alpha ${main}`), /RISK GATE/);
+  await approve.execute({ sessionID: "ses_1" });
+  assert.match(mock.syntheticCalls.at(-1).text, /THE USER APPROVED A STOPPED COMMAND/);
+  assert.match(mock.syntheticCalls.at(-1).text, /git checkout -B alpha/);
+  assert.equal(mock.syntheticCalls.at(-1).resume, true);
+  assert.equal(state().approvedRisk, "move-branch:alpha");
+  await assert.rejects(() => run("git branch -D alpha"), /RISK GATE/);       // a different operation is still stopped
+  assert.equal(state().approvedRisk, "move-branch:alpha");
+  await run(`git switch -C alpha ${main}`);                                    // the approved operation, however it is spelt
+  assert.equal(state().approvedRisk, undefined);
+  await assert.rejects(() => run(`git checkout -B alpha ${main}`), /RISK GATE/); // used up
+  await approve.execute({ sessionID: "ses_2" });
+  assert.match(mock.syntheticCalls.at(-1).text, /Nothing is waiting for approval/);
+
+  // The plan's checks are run by Fusion itself, so they may only verify; and none is dropped in silence.
+  await mock.tools.get("handoff_to_lead").execute({ reason: "blocked", summary: "stopped by the gate" }, { sessionID: "ses_1", agent: "fellow" });
+  const plan = (checks) => ({ summary: "Checks", steps: ["go"], checks });
+  for (const command of ["git push", "git commit -am done", "rm -rf dist", "npm install", `git checkout -B alpha ${main}`]) {
+    await assert.rejects(() => toFellow.execute(plan([{ command }]), { sessionID: "ses_1", agent: "lead" }), /A check only verifies; this one changes something/, `expected a refusal for the check: ${command}`);
+  }
+  await assert.rejects(
+    () => toFellow.execute(plan(Array.from({ length: 9 }, (_, i) => ({ command: `node -e "process.exit(${i})"` }))), { sessionID: "ses_1", agent: "lead" }),
+    /Too many checks: at most 8 in one list and 16 in the whole plan \(got 9 in one list, 9 in all\)/,
+  );
+  await toFellow.execute(plan([{ command: "git diff --exit-code" }, { command: "yarn test" }, PASS]), { sessionID: "ses_1", agent: "lead" });
+
+  await cleanup?.();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
