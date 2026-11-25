@@ -65,6 +65,12 @@ interface CheckResult {
   tail: string;
 }
 
+/** The workspace at one moment: a commit that holds it (HEAD, or HEAD with the uncommitted changes on top) and the files git did not know then. */
+interface WorkBase {
+  ref: string;
+  untracked: string[];
+}
+
 interface PlanPhase {
   title: string;
   steps: string[];
@@ -119,6 +125,9 @@ interface FusionState {
   // A command the risk gate stopped, waiting for the user's `/fusion-approve`; and the one approval not yet used.
   pendingRisk?: { key: string; command: string; what: string };
   approvedRisk?: string;
+  // The workspace when the current round began, and when the current phase began: what Lead is shown is measured from these.
+  roundBase?: WorkBase;
+  phaseBase?: WorkBase;
   // Which phase Fellow is on (0-based), and how often its checkpoint was sent back by failing checks.
   phaseIndex: number;
   phaseBounces: number;
@@ -1116,12 +1125,77 @@ function formatCheckResults(results: CheckResult[], withOutput: (result: CheckRe
   return lines;
 }
 
+const EVIDENCE_PREVIEW_CHARS = 3000;
+const EVIDENCE_STAT_LINES = 24;
+const IGNORED_ROW = /node_modules\/|opencode\.json$/;
+
+function normalizeWorkBase(raw: unknown): WorkBase | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj.ref !== "string" || !/^[0-9a-f]{7,64}$/.test(obj.ref)) return undefined;
+  return { ref: obj.ref, untracked: sanitizeStringList(obj.untracked).slice(0, 400) };
+}
+
+/** Records the workspace as it is, without touching it: `git stash create` writes the uncommitted state as a commit and changes nothing. */
+function snapshotWork(root: string): WorkBase | undefined {
+  const git = (args: string[]) => spawnSync("git", ["-C", root, "-c", "core.quotepath=false", ...args], { encoding: "utf8", windowsHide: true, timeout: 20_000, maxBuffer: 16 * 1024 * 1024 });
+  const out = (args: string[]) => {
+    const res = git(args);
+    return res.status === 0 && typeof res.stdout === "string" ? res.stdout.trim() : "";
+  };
+  const ref = out(["stash", "create"]) || out(["rev-parse", "HEAD"]);
+  if (!/^[0-9a-f]{7,64}$/.test(ref)) return undefined;
+  const untracked = out(["ls-files", "--others", "--exclude-standard"]).split("\n").filter((file) => file && !IGNORED_ROW.test(file)).slice(0, 400);
+  return { ref, untracked };
+}
+
+/**
+ * What changed since `base`: commits made, a diffstat, the files that are new, and the first part of the diff itself.
+ * This is what Lead reviews from, so it is measured from the start of the work under review and does not repeat
+ * whatever was already lying in the workspace before.
+ */
+function changeEvidence(root: string, base: WorkBase | undefined): { lines: string[]; files: string[] } {
+  if (!base) {
+    const digest = workspaceDigest(root);
+    return { lines: digest.summary, files: digest.files };
+  }
+  const git = (args: string[]) => spawnSync("git", ["-C", root, "-c", "core.quotepath=false", ...args], { encoding: "utf8", windowsHide: true, timeout: 20_000, maxBuffer: 64 * 1024 * 1024 });
+  const out = (args: string[]) => {
+    const res = git(args);
+    return res.status === 0 && typeof res.stdout === "string" ? res.stdout.replace(/\s+$/, "") : "";
+  };
+  const commits = out(["log", "--oneline", "-n", "12", `${base.ref}..HEAD`]).split("\n").filter(Boolean);
+  const changed = out(["diff", "--name-only", base.ref]).split("\n").filter((file) => file && !IGNORED_ROW.test(file));
+  const known = new Set(base.untracked);
+  const fresh = out(["ls-files", "--others", "--exclude-standard"]).split("\n").filter((file) => file && !IGNORED_ROW.test(file) && !known.has(file));
+  const files = [...changed, ...fresh];
+  if (files.length === 0 && commits.length === 0) return { lines: ["Changes since this work began: none."], files };
+  const stat = out(["diff", "--stat=110", base.ref]).split("\n").filter(Boolean);
+  const diff = out(["diff", "-U1", "--no-color", base.ref]);
+  const lines = [
+    `Changes since this work began (${files.length} file(s)${commits.length ? `, ${commits.length}${commits.length === 12 ? "+" : ""} commit(s)` : ""}):`,
+    ...commits.map((row) => `  commit ${row}`),
+    ...stat.slice(0, EVIDENCE_STAT_LINES).map((row) => `  ${row.trim()}`),
+    ...(stat.length > EVIDENCE_STAT_LINES ? [`  … ${stat.length - EVIDENCE_STAT_LINES} more lines of the summary`] : []),
+    ...(fresh.length ? [`  new files: ${fresh.slice(0, 12).join(", ")}${fresh.length > 12 ? `, … ${fresh.length - 12} more` : ""}`] : []),
+  ];
+  if (diff) {
+    lines.push(
+      diff.length > EVIDENCE_PREVIEW_CHARS
+        ? `The diff, first ${EVIDENCE_PREVIEW_CHARS} of ${diff.length} characters (the rest: \`git diff ${base.ref.slice(0, 10)}\`):`
+        : "The diff:",
+      diff.slice(0, EVIDENCE_PREVIEW_CHARS),
+    );
+  }
+  return { lines, files };
+}
+
 /** What the workspace looks like now: a short change summary for Lead and a fingerprint to notice rounds that changed nothing. */
 function workspaceDigest(root: string): { summary: string[]; hash?: string; files: string[] } {
   const git = (args: string[]) => spawnSync("git", ["-C", root, "-c", "core.quotepath=false", ...args], { encoding: "utf8", windowsHide: true, timeout: 20_000, maxBuffer: 64 * 1024 * 1024 });
   const status = git(["status", "--porcelain", "--untracked-files=all"]);
   if (status.status !== 0 || typeof status.stdout !== "string") return { summary: [], files: [] };
-  const rows = status.stdout.split("\n").filter((line) => line.trim() && !/node_modules\/|opencode\.json$/.test(line));
+  const rows = status.stdout.split("\n").filter((line) => line.trim() && !IGNORED_ROW.test(line));
   const diff = git(["diff", "HEAD"]);
   const stat = git(["diff", "HEAD", "--shortstat"]);
   // The commit is part of the fingerprint: a round that commits its work leaves a clean tree, which is not "nothing".
@@ -1602,6 +1676,8 @@ export default {
           ? { pendingRisk: { key: data.pendingRisk.key, command: String(data.pendingRisk.command ?? ""), what: String(data.pendingRisk.what ?? "") } }
           : {}),
         ...(typeof data.approvedRisk === "string" ? { approvedRisk: data.approvedRisk } : {}),
+        ...(normalizeWorkBase(data.roundBase) ? { roundBase: normalizeWorkBase(data.roundBase) } : {}),
+        ...(normalizeWorkBase(data.phaseBase) ? { phaseBase: normalizeWorkBase(data.phaseBase) } : {}),
         phaseIndex: typeof data.phaseIndex === "number" && data.phaseIndex >= 0 ? data.phaseIndex : 0,
         phaseBounces: typeof data.phaseBounces === "number" && data.phaseBounces >= 0 ? data.phaseBounces : 0,
         ...(typeof data.awaitingCheckpoint === "number" ? { awaitingCheckpoint: data.awaitingCheckpoint } : {}),
@@ -1775,7 +1851,7 @@ export default {
         const ses = await ctx.session.get({ sessionID }).catch(() => undefined);
         const root: string = ses?.location?.directory ?? ses?.directory ?? process.cwd();
         const checks = allPlanChecks(state.activePlan);
-        const lines = [...workspaceDigest(root).summary];
+        const lines = [...changeEvidence(root, state.roundBase).lines];
         if (checks.length === 0) return lines;
         if (!gateEnabled || !options.runPlanChecks) {
           lines.push(`The plan's ${checks.length} check(s) were NOT run by Fusion on this return. Nothing here is verified.`);
@@ -1940,9 +2016,15 @@ export default {
               activePlan: plan,
               incrementHandoffs: true,
             });
-            const startHash = workspaceDigest(await sessionRoot(sessionID)).hash;
-            const next: FusionState = { ...switched, phaseIndex: 0, phaseBounces: 0, ...(startHash ? { lastWorkHash: startHash } : {}) };
+            const startRoot = await sessionRoot(sessionID);
+            const startHash = workspaceDigest(startRoot).hash;
+            const startBase = snapshotWork(startRoot);
+            const next: FusionState = { ...switched, phaseIndex: 0, phaseBounces: 0, ...(startHash ? { lastWorkHash: startHash } : {}), ...(startBase ? { roundBase: startBase, phaseBase: startBase } : {}) };
             if (!startHash) delete next.lastWorkHash;
+            if (!startBase) {
+              delete next.roundBase;
+              delete next.phaseBase;
+            }
             delete next.awaitingCheckpoint;
             await saveState(next);
 
@@ -2044,8 +2126,8 @@ export default {
               };
             }
 
-            const digest = workspaceDigest(root);
-            const strays = offPlanFiles(digest.files, plan.files);
+            const evidence = changeEvidence(root, state.phaseBase ?? state.roundBase);
+            const strays = offPlanFiles(evidence.files, plan.files);
             const notPassed = results.filter((result) => result.status !== "passed");
             const reasons = [
               phase.review === "always" ? "Lead asked to see this checkpoint" : "",
@@ -2062,7 +2144,8 @@ export default {
 
             if (reasons.length === 0) {
               // Nothing calls for Lead: go straight on. This is the common case and costs no Lead call.
-              const advanced: FusionState = { ...state, activePlan: notedPlan, phaseIndex: index + 1, phaseBounces: 0, revision: state.revision + 1 };
+              const nextBase = snapshotWork(root);
+              const advanced: FusionState = { ...state, activePlan: notedPlan, phaseIndex: index + 1, phaseBounces: 0, revision: state.revision + 1, ...(nextBase ? { phaseBase: nextBase } : {}) };
               await saveState(advanced);
               const last = index + 1 >= phases.length;
               return {
@@ -2092,9 +2175,10 @@ export default {
                 deviations.length ? `Departures from the plan: ${deviations.join("; ")}` : "",
                 notes.length ? `Notes (no answer needed): ${notes.join("; ")}` : "",
                 ...checkLines,
-                ...digest.summary,
+                ...evidence.lines,
                 strays.length ? `Changed files outside the plan's files (${strays.length}): ${strays.slice(0, 12).join(", ")}${strays.length > 12 ? ", …" : ""}` : "",
                 index + 1 < phases.length ? `Phases still to do: ${phases.slice(index + 1).map((p, i) => `${index + 2 + i}. ${p.title}`).join(" | ")}` : "This was the last phase.",
+                "The changes above are this phase's, as they are on disk now. Read further only where they leave a doubt.",
                 "Answer with `resume_fellow`: `continue` to move on to the next phase, or `adjust` with short notes if this phase needs fixing first. Use `handoff_to_fellow` only if the approach itself must change.",
               ]
                 .filter(Boolean)
@@ -2149,7 +2233,8 @@ export default {
             const phaseIndex = decision === "continue" ? index + 1 : index;
 
             const switched = await switchRole({ sessionID, state, targetRole: "fellow", activePlan: amended, incrementHandoffs: true });
-            const next: FusionState = { ...switched, phaseIndex, phaseBounces: 0 };
+            const resumeBase = decision === "continue" ? snapshotWork(await sessionRoot(sessionID)) : undefined;
+            const next: FusionState = { ...switched, phaseIndex, phaseBounces: 0, ...(resumeBase ? { phaseBase: resumeBase } : {}) };
             delete next.awaitingCheckpoint;
             await saveState(next);
 
@@ -2233,6 +2318,13 @@ export default {
             const requirements = plan?.requirements ?? [];
             const checks = allPlanChecks(plan);
             const unreported = (plan?.phases ?? []).slice(state.phaseIndex).map((phase, offset) => `${state.phaseIndex + offset + 1}. ${phase.title}`);
+            // A phase Lead asked to see is seen: the work is not reported complete past it.
+            const owed = (plan?.phases ?? []).findIndex((phase, at) => at >= state.phaseIndex && phase.review === "always");
+            if (reason === "completed" && owed >= 0) {
+              throw new Error(
+                `Phase ${owed + 1} ("${plan!.phases[owed].title}") is one Lead asked to see. Call \`report_checkpoint\` for it before handing back as completed. If it cannot be finished, hand back with \`blocked\` or \`need_replan\` instead.`,
+              );
+            }
 
             // The verification gate. Fellow says it is done: run the plan's checks here instead of taking its word.
             const ses = await ctx.session.get({ sessionID }).catch(() => undefined);
@@ -2294,7 +2386,7 @@ export default {
                     : checks.length === 0 && plan
                       ? ["No `checks` were given in the plan, so nothing was verified by Fusion. Fellow's report above is unverified."]
                       : []),
-                ...digest.summary,
+                ...changeEvidence(root, state.roundBase).lines,
                 unreported.length && reason === "completed"
                   ? `Phases that were never reported at a checkpoint (their checks were only run now, at the end): ${unreported.join(" | ")}`
                   : "",

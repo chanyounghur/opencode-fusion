@@ -991,8 +991,8 @@ test("8. verification gate: failing checks go back to Fellow, then Lead gets rea
   assert.match(returned.content, /Checks run by Fusion: 1\/2 passed \(after 2 round\(s\) sent back/);
   assert.match(returned.content, /\[FAIL\]/);
   assert.match(returned.content, /Do not report this as done/);
-  assert.match(returned.content, /Workspace changes \(1 files/);
-  assert.match(returned.content, /b\.txt/);
+  assert.match(returned.content, /Changes since this work began \(1 file\(s\)\)/);
+  assert.match(returned.content, /new files: b\.txt/);
   assert.match(returned.content, /검색도 두고/);
   assert.match(returned.content, /1\. 찾기도 둔다/);
   assert.equal(mock.sessions.get("ses_1").agent, "lead");
@@ -1747,6 +1747,76 @@ test("19. the risk gate: a command that would lose work is stopped when Fellow r
     /Too many checks: at most 8 in one list and 16 in the whole plan \(got 9 in one list, 9 in all\)/,
   );
   await toFellow.execute(plan([{ command: "git diff --exit-code" }, { command: "yarn test" }, PASS]), { sessionID: "ses_1", agent: "lead" });
+
+  await cleanup?.();
+  fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("20. evidence with the report: Lead is shown what changed since the work began, commits included, and a phase it asked to see cannot be skipped", async () => {
+  const dir = tempProject();
+  const git = (...args) => execFileSync("git", ["-C", dir, ...args], { stdio: "ignore" });
+  // Something already lying in the workspace before the work starts: it is not this round's doing.
+  fs.writeFileSync(path.join(dir, "leftover.json"), "{}\n");
+  fs.writeFileSync(path.join(dir, "a.txt"), "one\nlocal edit\n");
+
+  const mock = createMockOpenCode();
+  const cleanup = await plugin.setup(mock.ctx);
+  mock.sessions.get("ses_1").location = { directory: dir };
+  const toFellow = mock.tools.get("handoff_to_fellow");
+  const toLead = mock.tools.get("handoff_to_lead");
+  const checkpoint = mock.tools.get("report_checkpoint");
+  const resume = mock.tools.get("resume_fellow");
+  const asLead = { sessionID: "ses_1", agent: "lead" };
+  const asFellow = { sessionID: "ses_1", agent: "fellow" };
+
+  // One undivided round in which Fellow edits, adds a file and commits.
+  await toFellow.execute({ summary: "Add the greeting", files: ["greet.js"], steps: ["write it", "commit"] }, asLead);
+  fs.writeFileSync(path.join(dir, "greet.js"), "export const greet = (name) => `hello ${name}`;\n");
+  git("add", "greet.js");
+  git("commit", "--quiet", "-m", "add greet");
+  fs.writeFileSync(path.join(dir, "notes.md"), "todo\n");
+  const back = await toLead.execute({ reason: "completed", summary: "added and committed" }, asFellow);
+  assert.match(back.content, /Changes since this work began \(2 file\(s\), 1 commit\(s\)\):/);
+  assert.match(back.content, /commit [0-9a-f]{7,} add greet/);          // a commit is shown, though the tree is clean again
+  assert.match(back.content, /greet\.js \| 1 \+/);
+  assert.match(back.content, /new files: notes\.md/);
+  assert.match(back.content, /The diff:\n[\s\S]*\+export const greet/);   // the change itself is in front of Lead
+  assert.doesNotMatch(back.content, /leftover\.json/);                   // what was there before is not repeated
+  assert.doesNotMatch(back.content, /local edit/);
+
+  // A round that changes nothing says so.
+  await toFellow.execute({ summary: "Check the greeting", steps: ["look"] }, asLead);
+  const nothing = await toLead.execute({ reason: "completed", summary: "looked" }, asFellow);
+  assert.match(nothing.content, /Changes since this work began: none\./);
+
+  // Phases: each checkpoint shows that phase's changes only, and a long diff is cut with a way to see the rest.
+  const phases = [
+    { title: "first part", steps: ["a"], checks: [], review: "always" },
+    { title: "second part", steps: ["b"], checks: [], review: "always" },
+  ];
+  await toFellow.execute({ summary: "Two parts", files: ["one.txt", "two.txt"], phases }, asLead);
+  fs.writeFileSync(path.join(dir, "one.txt"), "first\n");
+  git("add", "one.txt");
+  const first = await checkpoint.execute({ done: "wrote one.txt" }, asFellow);
+  assert.match(first.content, /CHECKPOINT 1\/2 — LEAD REVIEW/);
+  assert.match(first.content, /one\.txt/);
+  assert.match(first.content, /The changes above are this phase's/);
+  await resume.execute({ decision: "continue" }, asLead);
+
+  fs.writeFileSync(path.join(dir, "two.txt"), `${"a long line of text to fill the preview\n".repeat(200)}`);
+  git("add", "two.txt");
+  // The second phase is one Lead asked to see: reporting the whole work complete past it is refused.
+  await assert.rejects(() => toLead.execute({ reason: "completed", summary: "all done" }, asFellow), /Phase 2 \("second part"\) is one Lead asked to see\. Call `report_checkpoint`/);
+  const second = await checkpoint.execute({ done: "wrote two.txt" }, asFellow);
+  assert.match(second.content, /two\.txt/);
+  assert.doesNotMatch(second.content, /one\.txt/);                       // the first phase's change is not shown again
+  assert.match(second.content, /The diff, first 3000 of \d+ characters \(the rest: `git diff [0-9a-f]{10}`\):/);
+  assert.ok(second.content.length < 6000, `the checkpoint report stays small (${second.content.length} characters)`);
+  await resume.execute({ decision: "continue" }, asLead);
+  // The whole round is shown at the end, both phases together. A blocked return is never held up by an unseen phase.
+  const done = await toLead.execute({ reason: "completed", summary: "both parts" }, asFellow);
+  assert.match(done.content, /one\.txt/);
+  assert.match(done.content, /two\.txt/);
 
   await cleanup?.();
   fs.rmSync(dir, { recursive: true, force: true });
