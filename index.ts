@@ -2,7 +2,8 @@
  * Fusion — the server part.
  *
  * Two models share one OpenCode session: a strong one that reads, plans and reviews (the Lead) and a cheaper one
- * that does the long stretches of editing (the Fellow). OpenCode itself is not changed.
+ * that does every edit and every command (the Fellow). A third agent on the cheaper model, the scout, looks things up
+ * in a child session and sends back a short report. OpenCode itself is not changed.
  *
  * Implements:
  * - Strict PLAN-mode upper-bound allowlist permissions (never weakens stricter existing rules) + runtime guards
@@ -29,6 +30,13 @@
  *   `resume_fellow` (continue / adjust) instead of writing a whole new plan
  * - Lead reads, plans and reviews; Fellow does every edit and every command with effects. Lead's shell is limited to
  *   read-only commands (git log, ls, grep …). A small job is handed over with nothing but a `summary`.
+ * - The scout: lookups and wide exploration go through the host's `subagent` tool to an agent of this plugin, so
+ *   their raw material never enters the main conversation and the main session's model does not change.
+ * - The risk gate: a command that would lose work (commits on no other branch and no remote, uncommitted changes,
+ *   untracked files, history on a remote) is stopped when Fellow runs it, judged against the repository as it is.
+ *   Only the user lifts it, once, with `/fusion-approve`.
+ * - Evidence with the report: a checkpoint or a hand-back carries what changed since the work began (commits,
+ *   diffstat, the first part of the diff), so Lead reviews the change itself and not a description of it.
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -1186,6 +1194,21 @@ function changeEvidence(root: string, base: WorkBase | undefined): { lines: stri
         : "The diff:",
       diff.slice(0, EVIDENCE_PREVIEW_CHARS),
     );
+  }
+  // New files are not in the diff (git does not know them yet): show the start of each while there is room.
+  let room = EVIDENCE_PREVIEW_CHARS - Math.min(diff.length, EVIDENCE_PREVIEW_CHARS);
+  for (const file of fresh) {
+    if (room < 200) break;
+    try {
+      const body = readFileSync(nodePath.join(root, file));
+      if (body.length > 400_000 || body.includes(0)) continue;
+      const text = body.toString("utf8");
+      const shown = text.slice(0, Math.min(room, 1200));
+      lines.push(`New file ${file}${shown.length < text.length ? ` (first ${shown.length} of ${text.length} characters)` : ""}:`, shown.replace(/\s+$/, ""));
+      room -= shown.length;
+    } catch {
+      // a folder, or gone again
+    }
   }
   return { lines, files };
 }

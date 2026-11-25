@@ -196,15 +196,28 @@ test("real opencode serve: the mode and its agents, settings, role switching, >>
 
     // The Lead starts from "deny everything" and gets reading, planning and handing off.
     assert.deepEqual(lead.permissions[0], { action: "*", resource: "*", effect: "deny" });
-    for (const denied of ["edit", "write", "work_directly", "subagent", "execute", "handoff_to_lead", "opencode_worktree_create", "opencode_session_move", "artifact_write"]) {
+    for (const denied of ["edit", "write", "execute", "handoff_to_lead", "opencode_worktree_create", "opencode_session_move", "artifact_write"]) {
       assert.equal(lastRuleEffect(lead.permissions, denied), "deny", `expected the Lead to be denied ${denied}`);
     }
-    for (const allowed of ["read", "glob", "grep", "handoff_to_fellow", "opencode_session_read"]) {
+    for (const allowed of ["read", "glob", "grep", "handoff_to_fellow", "opencode_session_read", "subagent"]) {
       assert.equal(lastRuleEffect(lead.permissions, allowed), "allow", `expected the Lead to be allowed ${allowed}`);
     }
     // The shell passes the agent's rules; each call is held to read-only commands by the plugin's own check.
     assert.equal(lastRuleEffect(lead.permissions, "shell"), "allow");
     assert.match(lead.system ?? "", /A handoff comes in two sizes/);
+
+    // The scout: a subagent of its own for lookups, with the tools for looking and none for editing.
+    const scout = agents.find((a) => (a.id ?? a.name) === "scout");
+    assert.ok(scout, `agent scout missing: ${agentsRes.raw}`);
+    assert.equal(scout.mode, "subagent");
+    assert.match(scout.system ?? "", /Fusion SCOUT/);
+    assert.match(lead.system ?? "", /call the `subagent` tool with agent `scout`/);
+    for (const denied of ["edit", "write", "patch", "subagent", "handoff_to_fellow"]) {
+      assert.equal(lastRuleEffect(scout.permissions, denied), "deny", `expected the scout to be denied ${denied}`);
+    }
+    for (const allowed of ["read", "grep", "execute", "shell"]) {
+      assert.equal(lastRuleEffect(scout.permissions, allowed), "allow", `expected the scout to be allowed ${allowed}`);
+    }
 
     // 3. Settings: nothing chosen, nothing fixed by the configuration.
     const settings = await rpc(server, "getSettings", {});
