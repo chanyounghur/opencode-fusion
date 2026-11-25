@@ -366,7 +366,6 @@ test("1. agent.system, codemode:false, and upper-bound PLAN allowlist preserve s
     "edit",
     "write",
     "patch",
-    "subagent",
     "execute",
     "todowrite",
     "handoff_to_lead",
@@ -432,7 +431,6 @@ test("2. execute.before blocks Lead mutations and post-return sibling mutating t
     "edit",
     "write",
     "patch",
-    "subagent",
     "execute",
     "handoff_to_lead",
     "opencode_worktree_create",
@@ -1290,7 +1288,7 @@ test("16. Fusion mode: one more mode under a chosen name, a hidden Fellow, and s
   const onDisk = () => JSON.parse(fs.readFileSync(file, "utf8"));
 
   // The mode list gets one visible mode. Nothing is chosen yet and the starting mode is left alone.
-  assert.deepEqual([...mock.agents.keys()], ["fusion", "fellow"]);
+  assert.deepEqual([...mock.agents.keys()], ["fusion", "fellow", "scout"]);
   assert.equal(lead().name, "Fusion");
   assert.equal(lead().hidden, false);
   assert.equal(fellow().name, "Fellow");
@@ -1373,11 +1371,11 @@ test("16. Fusion mode: one more mode under a chosen name, a hidden Fellow, and s
   assert.equal(renamed.saved.modeName, "Engineer");
   assert.equal(renamed.effective.modeName, "Fusion");
   assert.equal(renamed.restartNeeded, true);
-  assert.deepEqual([...mock.agents.keys()], ["fusion", "fellow"]);
+  assert.deepEqual([...mock.agents.keys()], ["fusion", "fellow", "scout"]);
   assert.equal(lead().name, "Fusion");
   const restarted = install();
   const cleanupRestarted = await plugin.setup(restarted.ctx);
-  assert.deepEqual([...restarted.agents.keys()], ["engineer", "fellow"]);
+  assert.deepEqual([...restarted.agents.keys()], ["engineer", "fellow", "scout"]);
   assert.equal(restarted.agents.get("engineer").name, "Engineer");
   assert.deepEqual(restarted.agents.get("engineer").model, { providerID: "claude-agent", id: "opus", variant: "high" });
   const restartedView = await restarted.rpcRegistrations.get("fusion").handlers.getSettings({});
@@ -1407,7 +1405,7 @@ test("16. Fusion mode: one more mode under a chosen name, a hidden Fellow, and s
   // What the configuration states wins over what is saved, and is reported as fixed.
   const pinned = install({ leadModel: "openai/gpt-6.2-sol#medium", modeName: "Exam", fellowName: "worker", defaultMode: false });
   const cleanupPinned = await plugin.setup(pinned.ctx);
-  assert.deepEqual([...pinned.agents.keys()], ["exam", "worker"]);
+  assert.deepEqual([...pinned.agents.keys()], ["exam", "worker", "scout"]);
   pinned.agents.get("worker").model = { providerID: "deepseek", id: "deepseek-flash" };
   await pinned.ctx.agent.reload();
   assert.equal(pinned.agents.get("exam").name, "Exam");
@@ -1567,5 +1565,80 @@ test("17. Lead reads and Fellow acts: read-only shell for Lead, a small job hand
 
   // Fellow keeps its whole shell.
   await shell("npm install", "fellow");
+  await cleanup?.();
+});
+
+test("18. the scout: lookups run in a child session through the host's subagent tool, on the Fellow's model, without changing the project", async () => {
+  const mock = createMockOpenCode({ leadModel: "claude-agent/claude-opus-4-6", fellowModel: "openai/gpt-6.2-sol#high" });
+  const cleanup = await plugin.setup(mock.ctx);
+  const before = mock.toolBeforeHooks[0];
+  const scout = mock.agents.get("scout");
+  let n = 0;
+  const call = (tool, input, agent = "lead", sessionID = "ses_1") => {
+    const event = { tool, agent, sessionID, id: `c_${(n += 1)}`, messageID: `m_${n}`, input };
+    return before(event).then(() => event);
+  };
+
+  // A third agent, reached only through `subagent`: read-only tools, Code Mode for the tools behind it, no editing.
+  assert.equal(scout.mode, "subagent");
+  assert.deepEqual(scout.model, { providerID: "openai", id: "gpt-6.2-sol", variant: "high" });
+  assert.match(scout.system, /You are the Fusion SCOUT/);
+  for (const allowed of ["read", "grep", "glob", "webfetch", "execute", "shell"]) {
+    assert.equal(resolvePermissionEffect(scout.permissions, allowed), "allow", `scout should have ${allowed}`);
+  }
+  for (const denied of ["edit", "write", "patch", "subagent", "handoff_to_fellow", "handoff_to_lead", "todowrite"]) {
+    assert.equal(resolvePermissionEffect(scout.permissions, denied), "deny", `scout should not have ${denied}`);
+  }
+  assert.equal(resolvePermissionEffect(scout.permissions, "read", ".env"), "ask");
+
+  // Lead is told where lookups go, and may start the scout and nothing else.
+  const lead = mock.agents.get("lead");
+  assert.match(lead.system, /call the `subagent` tool with agent `scout`/);
+  assert.equal(resolvePermissionEffect(lead.permissions, "subagent"), "allow");
+  const started = await call("subagent", { agent: "scout", description: "Read the thread", prompt: "Read the chat thread at X and report who decided what." });
+  // It runs on the Fellow's model, and is told where raw material goes.
+  assert.equal(started.input.model, "openai/gpt-6.2-sol#high");
+  assert.match(started.input.prompt, /^Read the chat thread at X/);
+  assert.match(started.input.prompt, /\[Fusion\] Temp folder for raw material.*fusion-scout/);
+  await assert.rejects(() => call("subagent", { agent: "general", description: "Do it", prompt: "Implement the change." }), /one kind of subagent only: `scout`/);
+  await assert.rejects(() => call("subagent", { description: "Do it", prompt: "Implement the change." }), /one kind of subagent only/);
+  // A follow-up to a scout that is already running names its session; the task is left as written.
+  const followUp = await call("subagent", { sessionID: "ses_child", prompt: "Also check the linked ticket." });
+  assert.equal(followUp.input.prompt, "Also check the linked ticket.");
+  assert.equal(followUp.input.model, undefined);
+
+  // The scout's own calls, in its child session: looking is open, changing the repository is not.
+  const asScout = (command) => call("shell", { command }, "scout", "ses_child");
+  for (const command of [
+    "git log --oneline -5",
+    "git fetch origin",
+    "gh pr view 123 --json title,body",
+    "ffmpeg -i clip.mp4 -vf fps=1 /tmp/fusion-scout/f_%03d.png",
+    "curl -s https://example.com/status",
+    "rg -n TODO src | head -20 > /tmp/fusion-scout/todo.txt",
+    "node -e \"console.log(1)\"",
+  ]) {
+    await asScout(command);
+  }
+  for (const command of [
+    "git commit -am wip",
+    "git checkout -B main origin/main",
+    "git push",
+    "git stash",
+    "rm -rf build",
+    "mv a.txt b.txt",
+    "npm install left-pad",
+    "yarn add left-pad",
+    "ls && git reset --hard HEAD~1",
+  ]) {
+    await assert.rejects(() => asScout(command), /The scout does not change the project/, `expected a refusal for: ${command}`);
+  }
+  // No role state is made for the child session.
+  assert.equal(mock.storage.get("fusion:ses_child"), undefined);
+
+  // While Fellow has the session, Lead's tools stay closed, the scout included.
+  await mock.tools.get("handoff_to_fellow").execute({ summary: "Run the tests and report." }, { sessionID: "ses_1", agent: "lead" });
+  await assert.rejects(() => call("subagent", { agent: "scout", description: "x", prompt: "y" }), /only available in Lead mode/);
+
   await cleanup?.();
 });

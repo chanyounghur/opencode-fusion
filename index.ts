@@ -33,10 +33,12 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import nodePath from "node:path";
 
 type Role = "lead" | "fellow";
+// The three agents this plugin defines: the two roles of the session, and the scout that looks things up in a child session.
+type AgentKey = Role | "scout";
 
 interface ModelRef {
   providerID: string;
@@ -169,6 +171,8 @@ const DEFAULT_MODE_NAME = "Fusion";
 // moves it to the front of that list. A colour of its own keeps the mode looking the same either way.
 const DEFAULT_MODE_COLOR = "#ef6c6c";
 const DEFAULT_FELLOW_NAME = "fellow";
+const DEFAULT_SCOUT_NAME = "scout";
+
 const MAX_MODE_NAME_LENGTH = 24;
 // OpenCode's own agents. A mode cannot take one of their names.
 const RESERVED_AGENT_IDS = new Set(["build", "plan", "general", "explore", "compaction", "title", "summary"]);
@@ -231,6 +235,8 @@ const DEFAULT_MAX_FELLOW_STEPS = 200;
 const DEFAULT_MAX_HANDOFFS_PER_TURN = 12;
 // The agents' own step limit, set only where the configuration gives none.
 const DEFAULT_AGENT_STEPS = 200;
+// A lookup that needs more than this has become something else.
+const DEFAULT_SCOUT_STEPS = 60;
 const MAX_SEEN_MESSAGE_IDS = 100;
 const DEFAULT_VERIFY_RETRIES = 2;
 const DEFAULT_CHECK_TIMEOUT_SECONDS = 600;
@@ -263,6 +269,8 @@ const BASE_LEAD_ALLOWLIST = [
   "opencode_models",
   "handoff_to_fellow",
   "resume_fellow",
+  // The host's own tool, open to Lead for one agent only: the scout (checked per call in `execute.before`).
+  "subagent",
 ] as const;
 
 const FORBIDDEN_EXTRA_LEAD_TOOLS = new Set([
@@ -293,6 +301,8 @@ const READ_ONLY_COMMANDS = new Set([
   "file", "stat", "du", "tree", "which", "where", "echo", "true", "basename", "dirname", "realpath",
   "grep", "rg", "egrep", "fgrep", "findstr", "diff", "cmp", "jq",
 ]);
+// Commands the scout may not run at all: they exist to change or remove things.
+const SCOUT_REFUSED_COMMANDS = new Set(["rm", "rmdir", "mv", "del", "erase", "rd", "move", "ren", "rename", "chmod", "chown", "truncate", "dd", "mkfs", "sudo", "kill", "pkill", "taskkill", "brew", "apt", "apt-get", "choco", "winget"]);
 const READ_ONLY_GIT = new Set([
   "log", "show", "status", "diff", "blame", "rev-parse", "rev-list", "ls-files", "ls-tree", "ls-remote", "describe",
   "shortlog", "cat-file", "merge-base", "name-rev", "for-each-ref", "show-ref", "show-branch", "grep", "whatchanged",
@@ -460,11 +470,15 @@ const BENIGN_EXIT_ONE_COMMANDS = new Set([
   "findstr",
 ]);
 
+// Stands for the scout's agent id inside LEAD_PROMPT until the id is known (it follows the Fellow's name).
+const SCOUT_PLACEHOLDER = "\u0000scout\u0000";
+
 const LEAD_PROMPT = [
   "You are the Fusion LEAD: you read, decide how the work gets done, and review the result. You are the stronger and dearer model; Fellow is the cheaper one that does all the editing and all the running. You never change files or run anything that has effects yourself.",
   "- Inspect with read-only tools (read, glob, grep, webfetch, websearch, question, skill, session read/search, worktree list) and read-only shell commands (git log / status / diff / show / blame / branch --list, ls, cat, head, tail, wc, grep, rg, and pipes between them). Any other shell command is refused.",
-  "- Everything else goes to Fellow through `handoff_to_fellow`, however small: edits, installs, builds, tests, dev servers, screenshots, commits, pushes, deploys, pull requests, and lookups that need tools you do not have (Code Mode `execute`, MCP tools such as chat or design search). Never attempt edits, subagents, Code Mode execute, or worktree/session mutations yourself. Do not do a job in pieces through your own tools to avoid a handoff: every step you take rereads the whole conversation at your price.",
-  "- A handoff comes in two sizes. Small job (a command or two to run and report, a change of a few lines that you can state exactly, a lookup): give only `summary` — what to do and what to report back, in one to three sentences — plus `checks` when a command can confirm it. Write no steps, files or requirements for a small job. Larger work: give `summary`, target `files`, ordered `steps`, `requirements`, `checks`, `verification` notes and explicit `replanIf` stop conditions.",
+  "- Looking things up goes to the scout: call the `subagent` tool with agent `" + SCOUT_PLACEHOLDER + "`. Use it whenever only the answer matters and not the raw material: a chat thread, a ticket, logs, a web page, frames of a video, anything behind tools you do not have (Code Mode `execute`, MCP tools), and finding out where something lives in the code or how a wide area of it works. The scout starts with none of this conversation, so the task you give it must stand alone: what to find, where to look, what to report. It runs in the background on the cheaper model and you are woken with a short report; start several at once when the questions are independent, then end your response and wait. Its raw material never enters this conversation, which is the point: everything you read yourself is reread, at your price and at Fellow's, on every later step. Read files yourself when you need their exact text to write the plan (the few files that will change), not to explore.",
+  "- Everything that changes something goes to Fellow through `handoff_to_fellow`, however small: edits, installs, builds, tests, dev servers, screenshots, commits, pushes, deploys, pull requests. Never attempt edits, Code Mode execute, or worktree/session mutations yourself, and start no subagent other than the scout. Do not do a job in pieces through your own tools to avoid a handoff.",
+  "- A handoff comes in two sizes. Small job (a command or two to run and report, a change of a few lines that you can state exactly): give only `summary` — what to do and what to report back, in one to three sentences — plus `checks` when a command can confirm it. Write no steps, files or requirements for a small job. Larger work: give `summary`, target `files`, ordered `steps`, `requirements`, `checks`, `verification` notes and explicit `replanIf` stop conditions.",
   "- `requirements`: list every distinct thing the user asked for, one item each, close to the user's own words. Include asides and half-stated wishes (\"…도 두고\", \"while you're at it\"). When a phrase can be read two ways, keep it and add your reading in parentheses; never drop a request because it is vague. Every item needs a step that delivers it.",
   "- `checks`: the commands Fusion itself runs when Fellow reports completion (type check or build, and the relevant tests). Each entry is one bare command with an optional `cwd` relative to the project root: no commentary, no `cd`, exit code 0 means pass. If dependencies are missing, add a step that installs them rather than leaving a check out. Failing checks go back to Fellow without waking you.",
   "- For each new behaviour that no existing test covers (especially failure paths), include a step that adds a test for it.",
@@ -476,6 +490,25 @@ const LEAD_PROMPT = [
   "- The return message carries Fusion's own check results and a summary of what changed. Trust those over Fellow's description. Before concluding, go through `requirements` one by one against the changes, and look at anything Fellow reported under `missingRequirements`.",
   "- Do not conclude while a check is failing or could not run if another handoff can fix it (missing dependencies, a wrong command). When you do hand off again, put every remaining issue into that one handoff. If something truly cannot be verified here, tell the user exactly what was not verified.",
 ].join("\n");
+
+const SCOUT_PROMPT = [
+  "You are the Fusion SCOUT. Another agent (Lead) is planning work and needs one thing found out. You have none of its conversation: the task you were given is everything you know.",
+  "- Find the answer with the tools you have (reading files, searching, the web, Code Mode `execute` and MCP tools, shell commands that only look). Do not change the project: no edits, no installs, no commits, no branch or stash changes. If the task cannot be done without changing something, say so in the report instead.",
+  "- Your report is all that reaches Lead. Put the answer first, then what it rests on, each point with its source (file and line, URL, message time, command), then what you could not determine. Say plainly when something is your inference rather than something you saw.",
+  "- Keep the report short, about 400 words at most. Do not paste raw material (file contents, logs, thread transcripts): summarise it and say where it is. When Lead will need the raw material itself (images, a long log, a large diff), write it to a file under the temp folder named in your task and give the path.",
+  "- Stay on the question. If it turns out to be the wrong question, say why in the report and stop; do not widen the task yourself.",
+].join("\n");
+
+/** Appended to every task the scout is given: where raw material goes. The folder is outside the project on purpose. */
+function scoutTaskFooter(): string {
+  const dir = nodePath.join(tmpdir(), "fusion-scout");
+  try {
+    mkdirSync(dir, { recursive: true });
+  } catch {
+    // The scout is told the path either way; a missing folder shows up as its own error.
+  }
+  return `[Fusion] Temp folder for raw material Lead may need (never write inside the project): ${dir.replace(/\\/g, "/")}`;
+}
 
 const FELLOW_PROMPT = [
   "You are the Fusion FELLOW responsible for focused implementation and verification.",
@@ -655,6 +688,45 @@ function buildFellowPermissions(existingRules: PermissionRule[] = []): Permissio
     { action: "report_checkpoint", resource: "*", effect: "allow" },
   );
   return filtered;
+}
+
+/** The scout looks and reports. It gets the tools for that and no editing; its shell is checked per call. */
+function buildScoutPermissions(existingRules: PermissionRule[] = []): PermissionRule[] {
+  const rules: PermissionRule[] = [{ action: "*", resource: "*", effect: "deny" }];
+  for (const action of ["read", "glob", "grep", "webfetch", "websearch", "skill", "execute", "shell", "opencode_session_search", "opencode_session_read", "opencode_models"]) {
+    rules.push({ action, resource: "*", effect: "allow" });
+  }
+  for (const resource of ["*.env", "*.env.*", ".env", ".env.*"]) rules.push({ action: "read", resource, effect: "ask" });
+  // Stricter rules the configuration gave this agent are kept.
+  for (const rule of existingRules) {
+    if (!rule || typeof rule.action !== "string" || typeof rule.resource !== "string") continue;
+    if (rule.effect !== "deny" && rule.effect !== "ask") continue;
+    if (rule.action === "*" && rule.resource === "*") continue;
+    rules.push({ action: rule.action, resource: rule.resource, effect: rule.effect });
+  }
+  return rules;
+}
+
+/** Why the scout may not run this command, or undefined when it may. Looking is open; changing the repository is not. */
+function scoutShellRefusal(command: string): string | undefined {
+  if (!command.trim()) return "An empty command.";
+  const commands = splitShellCommands(command.replace(/>\s*("[^"]*"|'[^']*'|[^\s|;&]+)/g, " "), false);
+  // A line this cannot read is judged by its words alone.
+  const flat = commands ?? [command.split(/\s+/)];
+  for (const words of flat) {
+    let i = 0;
+    while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i])) i += 1;
+    const name = (words[i] ?? "").replace(/\\/g, "/").split("/").pop()!.toLowerCase().replace(/\.exe$/, "");
+    const args = words.slice(i + 1);
+    if (name === "git" && !isReadOnlyGit(args) && !["fetch"].includes(args.find((arg) => !arg.startsWith("-")) ?? "")) {
+      return `\`git ${args.slice(0, 2).join(" ")}\` changes the repository.`;
+    }
+    if (SCOUT_REFUSED_COMMANDS.has(name)) return `\`${name}\` changes files or installs things.`;
+    if ((name === "npm" || name === "pnpm" || name === "yarn" || name === "bun" || name === "pip" || name === "pip3") && /^(i|install|add|remove|uninstall|update|upgrade|publish|link|ci)$/.test(args.find((arg) => !arg.startsWith("-")) ?? "")) {
+      return `\`${name} ${args[0] ?? ""}\` installs or removes packages.`;
+    }
+  }
+  return undefined;
 }
 
 function extractShellCommand(input: unknown): string {
@@ -1150,9 +1222,12 @@ export default {
       [optionModeName, savedModeNameAtStart, DEFAULT_MODE_NAME].find(
         (name): name is string => typeof name === "string" && name.toLowerCase() !== fellowAgentID,
       ) ?? "Lead";
-    const AGENT: Record<Role, string> = { lead: modeNameInForce.toLowerCase(), fellow: fellowAgentID };
+    // The scout is named after the Fellow when the plain name is taken by one of the two.
+    const scoutAgentID = [DEFAULT_SCOUT_NAME, `${fellowAgentID}-scout`].find((id) => id !== fellowAgentID && id !== modeNameInForce.toLowerCase()) ?? `${fellowAgentID}-scout`;
+    const AGENT: Record<AgentKey, string> = { lead: modeNameInForce.toLowerCase(), fellow: fellowAgentID, scout: scoutAgentID };
+    const leadPrompt = LEAD_PROMPT.replace(SCOUT_PLACEHOLDER, scoutAgentID);
     // The saved model this plugin last put on each agent, so a later rebuild does not mistake it for configuration.
-    const appliedModel: RoleModels = {};
+    const appliedModel: RoleModels & { scout?: ModelRef } = {};
     const maxConsecutiveFailures = normalizePositiveInt(
       rawOptions.maxConsecutiveFailures,
       DEFAULT_MAX_CONSECUTIVE_FAILURES,
@@ -1218,7 +1293,6 @@ export default {
         if (agent.color === undefined) agent.color = DEFAULT_MODE_COLOR;
         if (agent.steps === undefined) agent.steps = DEFAULT_AGENT_STEPS;
         agent.description = "Read-only Architect/Reviewer Lead that designs verified steps and hands off via handoff_to_fellow.";
-        const leadPrompt = LEAD_PROMPT;
         if (!String(agent.system ?? "").includes(leadPrompt)) {
           agent.system = agent.system ? `${agent.system}\n\n${leadPrompt}` : leadPrompt;
         }
@@ -1259,6 +1333,28 @@ export default {
         agent.permissions = buildFellowPermissions(
           Array.isArray(agent.permissions) ? agent.permissions : [],
         );
+      });
+
+      editor.update(AGENT.scout, (agent: any) => {
+        // Reached through the host's `subagent` tool: a child session of its own, on the Fellow's model.
+        agent.mode = "subagent";
+        agent.hidden = false;
+        agent.name = AGENT.scout.charAt(0).toUpperCase() + AGENT.scout.slice(1);
+        if (agent.steps === undefined) agent.steps = DEFAULT_SCOUT_STEPS;
+        agent.description =
+          "Looks one thing up and reports briefly: a chat thread, a ticket, logs, a web page, or where something is in the code. Read-only. Its task must stand alone.";
+        if (!String(agent.system ?? "").includes(SCOUT_PROMPT)) {
+          agent.system = agent.system ? `${agent.system}\n\n${SCOUT_PROMPT}` : SCOUT_PROMPT;
+        }
+        const savedFellow = parseModelRef(settings.fellowModel);
+        if (optionFellowModel) {
+          agent.model = optionFellowModel;
+        } else if (!normalizeModelRef(agent.model) || sameModelRef(normalizeModelRef(agent.model), appliedModel.scout)) {
+          appliedModel.scout = savedFellow;
+          if (savedFellow) agent.model = savedFellow;
+          else delete agent.model;
+        }
+        agent.permissions = buildScoutPermissions(Array.isArray(agent.permissions) ? agent.permissions : []);
       });
     });
 
@@ -2127,10 +2223,37 @@ export default {
     const toolBeforeHook = await ctx.tool.hook("execute.before", async (event: any) => {
       const sessionID = event?.sessionID;
       if (!sessionID) return;
+      if (event.agent === AGENT.scout) {
+        // A child session of its own: no role state. The scout looks; it does not change the repository.
+        if (event.tool === "shell") {
+          const command = rawShellCommand(event.input);
+          const refusal = scoutShellRefusal(command);
+          if (refusal) throw new Error(`The scout does not change the project. ${refusal} If the task needs this, say so in your report instead.`);
+        }
+        return;
+      }
       await withSessionLock(sessionID, async () => {
         const state = await loadState(sessionID);
 
         if (event.agent === AGENT.lead) {
+          if (event.tool === "subagent") {
+            if (state.role !== "lead") throw new Error("subagent is only available in Lead mode.");
+            const input = event.input && typeof event.input === "object" ? (event.input as Record<string, unknown>) : {};
+            const asked = [input.agent, input.subagent_type, input.type].find((value) => typeof value === "string") as string | undefined;
+            // A follow-up to a scout already started names its session and may leave the agent out.
+            const followUp = typeof input.sessionID === "string" && input.sessionID.length > 0;
+            if (asked !== AGENT.scout && !(followUp && asked === undefined)) {
+              throw new Error(
+                `Lead starts one kind of subagent only: \`${AGENT.scout}\`, for looking things up. ${asked ? `"${asked}" is not it. ` : ""}Work that changes something goes to Fellow with handoff_to_fellow.`,
+              );
+            }
+            // The scout runs on this session's Fellow model, also when that was chosen for this session only.
+            const fellowModel = state.roleModels.fellow ?? (await resolveConfiguredRoleModels()).fellow;
+            if (fellowModel && !followUp) input.model = formatModelRef(fellowModel);
+            if (typeof input.prompt === "string" && !followUp) input.prompt = `${input.prompt}\n\n${scoutTaskFooter()}`;
+            if (event?.id) inFlightCallEpoch.set(callKey(sessionID, String(event.id)), state.epoch);
+            return;
+          }
           if (event.tool === "shell") {
             // Looking is always open to Lead; a command with effects is Fellow's.
             const command = rawShellCommand(event.input);
