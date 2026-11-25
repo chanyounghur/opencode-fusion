@@ -29,14 +29,10 @@
  *   `resume_fellow` (continue / adjust) instead of writing a whole new plan
  * - Lead reads, plans and reviews; Fellow does every edit and every command with effects. Lead's shell is limited to
  *   read-only commands (git log, ls, grep …). A small job is handed over with nothing but a `summary`.
- * - Direct work (off by default, `directWork: true` switches it on): Lead may make a small, certain change itself instead of handing off.
- *   `work_directly` opens editing and shell inside a budget (files, changed lines, steps), `finish_direct` runs the
- *   checks and closes it. Past the budget edits are refused and the rest goes to Fellow. Also used for a small
- *   correction after Fellow returns.
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import nodePath from "node:path";
 
@@ -94,22 +90,6 @@ interface ActivePlan {
   createdAt: string;
 }
 
-/** Lead working on the code itself. Open from `work_directly` until `finish_direct`, a handoff, or the next user prompt. */
-interface DirectWindow {
-  reason: string;
-  files: string[];
-  requirements: string[];
-  checks: PlanCheck[];
-  // The changed files when the window opened ("lines:hash" each), so only what Lead changes itself is counted.
-  base: Record<string, string>;
-  steps: number;
-  seen: string[];
-  bounces: number;
-  // How often Lead replaced the checks of this window (a command that cannot run on this machine).
-  checksReplaced: number;
-  openedAt: string;
-}
-
 interface FusionState {
   sessionID: string;
   role: Role;
@@ -136,11 +116,6 @@ interface FusionState {
   phaseBounces: number;
   // Set while Lead is looking at a checkpoint: the phase it concerns.
   awaitingCheckpoint?: number;
-  direct?: DirectWindow;
-  // What Lead has done itself since the user's last prompt: windows opened, and the files and lines they changed.
-  directWindowsInTurn: number;
-  directLinesInTurn: number;
-  directFilesInTurn: string[];
   roleModels: RoleModels;
   updatedAt: string;
 }
@@ -167,13 +142,6 @@ interface PluginOptions {
   maxStalledReturns?: number;
   // Changed files outside the plan's `files` (and their folders) beyond this number wake Lead at a checkpoint.
   offPlanFilesLimit?: number;
-  // true lets Lead make small changes itself (`work_directly`). Off by default: Lead reads, plans and reviews.
-  directWork?: boolean;
-  // The budget of direct work per user turn, and per window for steps.
-  maxDirectFiles?: number;
-  maxDirectLines?: number;
-  maxDirectSteps?: number;
-  maxDirectWindows?: number;
   // The name of the mode in the mode list. Given here it cannot be changed from `/fusion-settings`.
   modeName?: string;
   // The name of the hidden agent that does the delegated work (default "fellow").
@@ -202,7 +170,7 @@ const MAX_MODE_NAME_LENGTH = 24;
 // OpenCode's own agents. A mode cannot take one of their names.
 const RESERVED_AGENT_IDS = new Set(["build", "plan", "general", "explore", "compaction", "title", "summary"]);
 // Every tool this plugin adds. Other modes (Build, Plan) never see them.
-const FUSION_TOOLS = new Set(["handoff_to_fellow", "handoff_to_lead", "resume_fellow", "report_checkpoint", "work_directly", "finish_direct"]);
+const FUSION_TOOLS = new Set(["handoff_to_fellow", "handoff_to_lead", "resume_fellow", "report_checkpoint"]);
 
 function defaultSettingsFile(): string {
   const fromEnv = process.env.OPENCODE_FUSION_SETTINGS;
@@ -269,15 +237,7 @@ const MAX_PHASES = 8;
 const DEFAULT_OFF_PLAN_FILES_LIMIT = 5;
 const CHECK_TAIL_CHARS = 1500;
 const ROLE_MODEL_CACHE_TTL_MS = 2000;
-const DEFAULT_MAX_DIRECT_FILES = 8;
-const DEFAULT_MAX_DIRECT_LINES = 200;
-const DEFAULT_MAX_DIRECT_STEPS = 30;
-const DEFAULT_MAX_DIRECT_WINDOWS = 3;
-// A window's checks may be replaced this often (a wrong command), so replacing cannot become a way around a failure.
-const MAX_DIRECT_CHECK_REPLACEMENTS = 2;
-// What `work_directly` opens for Lead. Everything else that changes things stays closed to it.
-const DIRECT_TOOLS = new Set(["edit", "write", "patch", "shell"]);
-const LEAD_ONLY_TOOLS = new Set(["handoff_to_fellow", "resume_fellow", "work_directly", "finish_direct"]);
+const LEAD_ONLY_TOOLS = new Set(["handoff_to_fellow", "resume_fellow"]);
 
 const BASE_LEAD_ALLOWLIST = [
   "read",
@@ -475,24 +435,6 @@ const LEAD_PROMPT = [
   "- Do not conclude while a check is failing or could not run if another handoff can fix it (missing dependencies, a wrong command). When you do hand off again, put every remaining issue into that one handoff. If something truly cannot be verified here, tell the user exactly what was not verified.",
 ].join("\n");
 
-/** Lead's prompt when it may also work on the code itself (`directWork: true`). The first three lines (Lead never edits) are replaced. */
-function leadPromptFor(direct: boolean, limits: { files: number; lines: number }): string {
-  if (!direct) return LEAD_PROMPT;
-  const rest = LEAD_PROMPT.split("\n")
-    .slice(3)
-    .map((line) => line.replace("or issue a revised `handoff_to_fellow`.", "issue a revised `handoff_to_fellow`, or fix a small thing yourself with `work_directly`."));
-  return [
-    "You are the Fusion LEAD: you read the code, decide how the work gets done, and review the result. You are the stronger and dearer model; Fellow is the cheaper one that does the long stretches of editing.",
-    "- Start by reading (read, glob, grep, webfetch, websearch, skill, session read/search, and read-only shell commands such as git log / status / diff, ls, cat, grep). Reading is always open to you. Editing and every other shell command are closed until you call `work_directly`.",
-    "- Then choose how the work gets done. A handoff costs a written plan, a model switch and Fellow reading again what you already read, so it only pays when there is real work to hand over. Doing long work yourself spends your tokens on every line.",
-    `  - \`work_directly\` (you do it yourself): when, after reading, you already know exactly what to change, it comes to a few places (at most about ${limits.files} files and ${limits.lines} changed lines, tests included), nothing in it is a design decision that could turn out wrong, and a check can confirm it. Also when the task only asks for something written down (a review, a note, an answer in a file). Also for a small correction after Fellow returns (a wrong condition, a missed line, a forgotten file) instead of another handoff.`,
-    "  - `handoff_to_fellow`: everything else. Work spread over many files, new modules, anything you would have to explore while writing. When you cannot tell which it is, hand off.",
-    "- In `work_directly` give the `reason`, the `files` you will touch, the user's `requirements` and the `checks` that prove the change. Make the change, then call `finish_direct`: Fusion runs the checks and tells you the result. The budget is enforced: past it your edits are refused. If the work turns out bigger than you thought, stop and call `handoff_to_fellow` with a plan that says what you already changed and what remains.",
-    "- Never use subagents, Code Mode execute, or worktree/session mutations.",
-    ...rest,
-  ].join("\n");
-}
-
 const FELLOW_PROMPT = [
   "You are the Fusion FELLOW responsible for focused implementation and verification.",
   "- Follow the active `fusion.plan` in instructions strictly; make clean, minimal edits and run the specified `verification` commands.",
@@ -654,7 +596,7 @@ function buildLeadPermissions(
 }
 
 function buildFellowPermissions(existingRules: PermissionRule[] = []): PermissionRule[] {
-  const own = new Set(["handoff_to_fellow", "handoff_to_lead", "resume_fellow", "report_checkpoint", "work_directly", "finish_direct"]);
+  const own = new Set(FUSION_TOOLS);
   const filtered = existingRules.filter((rule) => rule && !own.has(rule.action));
   if (filtered.length === 0) {
     filtered.push(
@@ -666,8 +608,6 @@ function buildFellowPermissions(existingRules: PermissionRule[] = []): Permissio
   filtered.push(
     { action: "handoff_to_fellow", resource: "*", effect: "deny" },
     { action: "resume_fellow", resource: "*", effect: "deny" },
-    { action: "work_directly", resource: "*", effect: "deny" },
-    { action: "finish_direct", resource: "*", effect: "deny" },
     { action: "handoff_to_lead", resource: "*", effect: "allow" },
     { action: "report_checkpoint", resource: "*", effect: "allow" },
   );
@@ -941,92 +881,6 @@ function workspaceDigest(root: string): { summary: string[]; hash?: string; file
   return { summary, hash, files: rows.map((line) => line.slice(3).trim().replace(/^"|"$/g, "")) };
 }
 
-/**
- * The changed files of the workspace, each as "lines:hash": lines changed against HEAD (for a new file, its length)
- * and a fingerprint of its content. Two of these, taken at different times, show what was changed in between.
- */
-function measureWork(root: string): Record<string, string> | undefined {
-  const git = (args: string[]) => spawnSync("git", ["-C", root, "-c", "core.quotepath=false", ...args], { encoding: "utf8", windowsHide: true, timeout: 20_000, maxBuffer: 64 * 1024 * 1024 });
-  const status = git(["status", "--porcelain", "--untracked-files=all"]);
-  if (status.status !== 0 || typeof status.stdout !== "string") return undefined;
-  const counted = new Map<string, number>();
-  const numstat = git(["diff", "HEAD", "--numstat"]);
-  for (const line of (typeof numstat.stdout === "string" ? numstat.stdout : "").split("\n")) {
-    const match = /^(\d+|-)\t(\d+|-)\t(.+)$/.exec(line);
-    if (match) counted.set(match[3].trim().replace(/^"|"$/g, ""), (match[1] === "-" ? 0 : Number(match[1])) + (match[2] === "-" ? 0 : Number(match[2])));
-  }
-  const out: Record<string, string> = {};
-  for (const row of status.stdout.split("\n")) {
-    if (!row.trim() || /node_modules\/|opencode\.json$/.test(row)) continue;
-    const file = row.slice(3).trim().replace(/^.* -> /, "").replace(/^"|"$/g, "");
-    let lines = counted.get(file) ?? 1;
-    let mark = "gone";
-    try {
-      const full = `${root}/${file}`;
-      const info = statSync(full);
-      if (info.size > 2_000_000) mark = `big${info.size}`;
-      else {
-        const body = readFileSync(full);
-        mark = createHash("sha1").update(body).digest("hex").slice(0, 12);
-        if (row.startsWith("??")) {
-          const text = body.toString("utf8");
-          lines = text.length === 0 ? 0 : text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
-        }
-      }
-    } catch {
-      // deleted, or a folder: the status row alone says it changed
-    }
-    out[file] = `${lines}:${mark}`;
-  }
-  return out;
-}
-
-/** Files that differ between two measurements, and roughly how many lines (an in-place rewrite counts as one). */
-function directUsage(base: Record<string, string>, now: Record<string, string>): { files: string[]; lines: number } {
-  const files: string[] = [];
-  let lines = 0;
-  for (const file of new Set([...Object.keys(base), ...Object.keys(now)])) {
-    if (base[file] === now[file]) continue;
-    const count = (value: string | undefined) => (value ? Number(value.split(":")[0]) || 0 : 0);
-    files.push(file);
-    lines += Math.max(1, Math.abs(count(now[file]) - count(base[file])));
-  }
-  return { files, lines };
-}
-
-/** The state after a direct window closes: what it changed is added to the turn's total. */
-function closeDirectWindow(state: FusionState, usage: { files: string[]; lines: number }): FusionState {
-  const next: FusionState = {
-    ...state,
-    directLinesInTurn: state.directLinesInTurn + usage.lines,
-    directFilesInTurn: [...new Set([...state.directFilesInTurn, ...usage.files])].slice(0, 200),
-    revision: state.revision + 1,
-  };
-  delete next.direct;
-  return next;
-}
-
-function normalizeDirectWindow(raw: unknown): DirectWindow | undefined {
-  if (!raw || typeof raw !== "object") return undefined;
-  const obj = raw as Record<string, unknown>;
-  const base: Record<string, string> = {};
-  if (obj.base && typeof obj.base === "object") {
-    for (const [file, value] of Object.entries(obj.base as Record<string, unknown>)) if (typeof value === "string") base[file] = value;
-  }
-  return {
-    reason: typeof obj.reason === "string" ? obj.reason : "",
-    files: sanitizeStringList(obj.files),
-    requirements: sanitizeStringList(obj.requirements),
-    checks: sanitizeChecks(obj.checks),
-    base,
-    steps: typeof obj.steps === "number" && obj.steps >= 0 ? obj.steps : 0,
-    seen: sanitizeStringList(obj.seen).slice(-60),
-    bounces: typeof obj.bounces === "number" && obj.bounces >= 0 ? obj.bounces : 0,
-    checksReplaced: typeof obj.checksReplaced === "number" && obj.checksReplaced >= 0 ? obj.checksReplaced : 0,
-    openedAt: typeof obj.openedAt === "string" ? obj.openedAt : new Date().toISOString(),
-  };
-}
-
 function callKey(sessionID: string, callID: string): string {
   return `${sessionID}\0${callID}`;
 }
@@ -1266,24 +1120,16 @@ export default {
     const checkTimeoutMs = normalizePositiveInt(rawOptions.checkTimeoutSeconds, DEFAULT_CHECK_TIMEOUT_SECONDS) * 1000;
     const maxStalledReturns = normalizePositiveInt(rawOptions.maxStalledReturns, DEFAULT_MAX_STALLED_RETURNS);
     const offPlanFilesLimit = normalizePositiveInt(rawOptions.offPlanFilesLimit, DEFAULT_OFF_PLAN_FILES_LIMIT);
-    // Off unless switched on: Lead reads, plans and reviews, and Fellow does the editing and running.
-    const directEnabled = rawOptions.directWork === true;
-    const maxDirectFiles = normalizePositiveInt(rawOptions.maxDirectFiles, DEFAULT_MAX_DIRECT_FILES);
-    const maxDirectLines = normalizePositiveInt(rawOptions.maxDirectLines, DEFAULT_MAX_DIRECT_LINES);
-    const maxDirectSteps = normalizePositiveInt(rawOptions.maxDirectSteps, DEFAULT_MAX_DIRECT_STEPS);
-    const maxDirectWindows = normalizePositiveInt(rawOptions.maxDirectWindows, DEFAULT_MAX_DIRECT_WINDOWS);
     const optionLeadModel = parseModelRef(rawOptions.leadModel);
     const optionFellowModel = parseModelRef(rawOptions.fellowModel);
 
     const leadAllowedTools = new Set<string>([
       ...BASE_LEAD_ALLOWLIST,
       ...sanitizeExtraLeadTools(rawOptions.extraLeadTools),
-      ...(directEnabled ? ["work_directly", "finish_direct"] : []),
     ]);
-    // The agent's own rules must let these tools through; whether a call may run is decided per call, in
-    // `execute.before`: the shell for read-only commands, the editing tools only inside an open direct window and
-    // inside the budget.
-    const leadPermissionTools = new Set<string>([...leadAllowedTools, "shell", ...(directEnabled ? DIRECT_TOOLS : [])]);
+    // The agent's own rules must let the shell through; whether a command may run is decided per call, in
+    // `execute.before`: read-only commands only.
+    const leadPermissionTools = new Set<string>([...leadAllowedTools, "shell"]);
 
     const sessionLocks = new Map<string, Promise<void>>();
     const inFlightCallEpoch = new Map<string, number>();
@@ -1320,10 +1166,8 @@ export default {
         // A colour given in the configuration (`agents.<mode>.color`) is kept.
         if (agent.color === undefined) agent.color = DEFAULT_MODE_COLOR;
         if (agent.steps === undefined) agent.steps = DEFAULT_AGENT_STEPS;
-        agent.description = directEnabled
-          ? "Architect/Reviewer Lead: makes small, certain changes itself (work_directly) and hands larger work off via handoff_to_fellow."
-          : "Read-only Architect/Reviewer Lead that designs verified steps and hands off via handoff_to_fellow.";
-        const leadPrompt = leadPromptFor(directEnabled, { files: maxDirectFiles, lines: maxDirectLines });
+        agent.description = "Read-only Architect/Reviewer Lead that designs verified steps and hands off via handoff_to_fellow.";
+        const leadPrompt = LEAD_PROMPT;
         if (!String(agent.system ?? "").includes(leadPrompt)) {
           agent.system = agent.system ? `${agent.system}\n\n${leadPrompt}` : leadPrompt;
         }
@@ -1427,9 +1271,6 @@ export default {
         stalledReturns: 0,
         phaseIndex: 0,
         phaseBounces: 0,
-        directWindowsInTurn: 0,
-        directLinesInTurn: 0,
-        directFilesInTurn: [],
         roleModels: stripOptional({
           lead: configuredRoleModels.lead,
           fellow: configuredRoleModels.fellow,
@@ -1479,10 +1320,6 @@ export default {
         phaseIndex: typeof data.phaseIndex === "number" && data.phaseIndex >= 0 ? data.phaseIndex : 0,
         phaseBounces: typeof data.phaseBounces === "number" && data.phaseBounces >= 0 ? data.phaseBounces : 0,
         ...(typeof data.awaitingCheckpoint === "number" ? { awaitingCheckpoint: data.awaitingCheckpoint } : {}),
-        ...(normalizeDirectWindow(data.direct) ? { direct: normalizeDirectWindow(data.direct) } : {}),
-        directWindowsInTurn: typeof data.directWindowsInTurn === "number" && data.directWindowsInTurn >= 0 ? data.directWindowsInTurn : 0,
-        directLinesInTurn: typeof data.directLinesInTurn === "number" && data.directLinesInTurn >= 0 ? data.directLinesInTurn : 0,
-        directFilesInTurn: sanitizeStringList(data.directFilesInTurn),
         roleModels: stripOptional({
           lead: normalizeModelRef(storedRoleModels.lead) ?? configuredRoleModels.lead,
           fellow: normalizeModelRef(storedRoleModels.fellow) ?? configuredRoleModels.fellow,
@@ -1646,13 +1483,6 @@ export default {
       return ses?.location?.directory ?? ses?.directory ?? process.cwd();
     }
 
-    /** What the open direct window has changed so far, and the turn's total with it. */
-    function directSpent(state: FusionState, root: string): { usage: { files: string[]; lines: number }; files: number; lines: number } {
-      const now = state.direct ? measureWork(root) : undefined;
-      const usage = state.direct && now ? directUsage(state.direct.base, now) : { files: [], lines: 0 };
-      return { usage, files: new Set([...state.directFilesInTurn, ...usage.files]).size, lines: state.directLinesInTurn + usage.lines };
-    }
-
     /** Lines for an automatic return: what changed, and whether the plan's checks hold. */
     async function unplannedReturnContext(sessionID: string, state: FusionState, options: { runPlanChecks: boolean }): Promise<string[]> {
       try {
@@ -1758,16 +1588,9 @@ export default {
           const sessionID = toolCtx?.sessionID;
           if (!sessionID) throw new Error("handoff_to_fellow requires sessionID.");
           return withSessionLock(sessionID, async () => {
-            let state = await loadState(sessionID, { refreshModels: true });
+            const state = await loadState(sessionID, { refreshModels: true });
             if (toolCtx?.agent !== AGENT.lead || state.role !== "lead") {
               throw new Error("handoff_to_fellow is only available in Lead mode.");
-            }
-            // Handing off ends Lead's own work: what it changed so far stays, and is counted.
-            let directNote = "";
-            if (state.direct) {
-              const spent = directSpent(state, await sessionRoot(sessionID));
-              state = closeDirectWindow(state, spent.usage);
-              directNote = `Lead's own direct work was closed by this handoff (it changed ${spent.usage.files.length} file(s), about ${spent.usage.lines} line(s)). Those changes are in the workspace: build on them.`;
             }
             if (state.handoffsInTurn >= maxHandoffsPerTurn) {
               throw new Error(
@@ -1825,7 +1648,6 @@ export default {
                 "[FUSION: FELLOW MODE ACTIVE]",
                 `Active agent: fellow | Target model: ${formatModelRef(targetModel)} | Epoch: ${next.epoch} | Handoff ${next.handoffsInTurn}/${maxHandoffsPerTurn}`,
                 `Plan summary: ${plan.summary} (${files.length} files, ${steps.length} steps). Follow active \`fusion.plan\` in instructions. Guardrails: maxConsecutiveFailures=${maxConsecutiveFailures}, maxFellowSteps=${maxFellowSteps}. Call \`handoff_to_lead\` when finished or blocked.`,
-                directNote,
                 requirements.length
                   ? `Requirements (${requirements.length}): compare these with the user's original request before you start, and report anything the request asks for that is not here.`
                   : "",
@@ -2187,188 +2009,6 @@ export default {
       });
     });
 
-    if (directEnabled) {
-      await ctx.tool.transform((editor: any) => {
-        const CHECKS_INPUT = {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              command: { type: "string", description: "One bare command; exit code 0 means pass. No commentary, no cd." },
-              cwd: { type: "string", description: "Folder to run in, relative to the project root. Omit for the root." },
-            },
-            required: ["command"],
-            additionalProperties: false,
-          },
-        } as const;
-
-        editor.add({
-          name: "work_directly",
-          description:
-            "Lead-only tool. Opens editing and shell for Lead itself, inside a budget, for a small and certain change (or a note the task asks for, or a small correction after Fellow returns). Close it with `finish_direct`. For anything larger use `handoff_to_fellow`.",
-          options: { codemode: false },
-          input: {
-            type: "object",
-            properties: {
-              reason: { type: "string", description: "Why this is small and certain enough to do yourself: what you will change and why no handoff is needed." },
-              files: { type: "array", items: { type: "string" }, description: "The files you expect to touch." },
-              requirements: { type: "array", items: { type: "string" }, description: "Everything the user asked for, one item each, close to their own words." },
-              checks: { ...CHECKS_INPUT, description: "Commands Fusion runs when you call `finish_direct` (type check or build, the relevant tests). Use the command this repository itself uses for its tests. Leave empty only when nothing can check it (a written note). While a window is open, calling `work_directly` again with new `checks` replaces them." },
-            },
-            required: ["reason", "files"],
-            additionalProperties: false,
-          },
-          async execute(args: any, toolCtx: any) {
-            const sessionID = toolCtx?.sessionID;
-            if (!sessionID) throw new Error("work_directly requires sessionID.");
-            return withSessionLock(sessionID, async () => {
-              const state = await loadState(sessionID, { refreshModels: true });
-              if (toolCtx?.agent !== AGENT.lead || state.role !== "lead") {
-                throw new Error("work_directly is only available in Lead mode.");
-              }
-              if (state.awaitingCheckpoint !== undefined) {
-                throw new Error("A checkpoint is waiting for your answer. Answer it with `resume_fellow` first.");
-              }
-              const budget = `Budget for this turn: ${maxDirectFiles} files, about ${maxDirectLines} changed lines, ${maxDirectSteps} steps per window.`;
-              if (state.direct) {
-                // Calling it again while open replaces the checks: a command that cannot run on this machine is
-                // Lead's own mistake, and without this it could only be corrected by letting the window close.
-                const replacement = sanitizeChecks(args?.checks);
-                if (replacement.length > 0 && JSON.stringify(replacement) !== JSON.stringify(state.direct.checks)) {
-                  if (state.direct.checksReplaced >= MAX_DIRECT_CHECK_REPLACEMENTS) {
-                    throw new Error(
-                      `The checks of this window were already replaced ${state.direct.checksReplaced} times. Call \`finish_direct\`, hand off, or tell the user exactly what could not be verified and why.`,
-                    );
-                  }
-                  const replaced: FusionState = {
-                    ...state,
-                    direct: { ...state.direct, checks: replacement, checksReplaced: state.direct.checksReplaced + 1 },
-                    revision: state.revision + 1,
-                  };
-                  await saveState(replaced);
-                  return {
-                    content: [
-                      "[FUSION: DIRECT WORK — CHECKS REPLACED, SAME WINDOW]",
-                      `Fusion will run these ${replacement.length} check(s) when you call \`finish_direct\`:`,
-                      ...replacement.map((check) => `  - ${check.command}${check.cwd ? ` (in ${check.cwd})` : ""}`),
-                      "No new window was opened and the budget is unchanged. Replace a check only when the command itself was wrong, never to get past a failure your change causes.",
-                    ].join("\n"),
-                  };
-                }
-                return {
-                  content: `Direct work is already open (${state.direct.steps}/${maxDirectSteps} steps used). ${budget} Carry on, and call \`finish_direct\` when the change is complete. To correct a check command that cannot run here, call \`work_directly\` again with the new \`checks\`.`,
-                };
-              }
-              if (state.directWindowsInTurn >= maxDirectWindows) {
-                throw new Error(
-                  `Direct work was already opened ${state.directWindowsInTurn} times this turn (limit ${maxDirectWindows}). Give what remains to Fellow with \`handoff_to_fellow\`, or conclude and tell the user what remains.`,
-                );
-              }
-              if (state.directFilesInTurn.length > maxDirectFiles || state.directLinesInTurn > maxDirectLines) {
-                throw new Error(
-                  `The direct-work budget of this turn is used up (${state.directFilesInTurn.length} files, about ${state.directLinesInTurn} lines; limit ${maxDirectFiles} files, ${maxDirectLines} lines). Give what remains to Fellow with \`handoff_to_fellow\`.`,
-                );
-              }
-              const reason = typeof args?.reason === "string" ? args.reason.trim() : "";
-              if (!reason) throw new Error("work_directly needs a `reason`: what you will change and why it needs no handoff.");
-              const window: DirectWindow = {
-                reason,
-                files: sanitizeStringList(args?.files),
-                requirements: sanitizeStringList(args?.requirements),
-                checks: sanitizeChecks(args?.checks),
-                base: measureWork(await sessionRoot(sessionID)) ?? {},
-                steps: 0,
-                seen: [],
-                bounces: 0,
-                checksReplaced: 0,
-                openedAt: new Date().toISOString(),
-              };
-              const next: FusionState = { ...state, direct: window, directWindowsInTurn: state.directWindowsInTurn + 1, revision: state.revision + 1 };
-              await saveState(next);
-              return {
-                content: [
-                  `[FUSION: DIRECT WORK OPEN — window ${next.directWindowsInTurn}/${maxDirectWindows}]`,
-                  "Editing and shell are open to you now. You are still Lead; no handoff was made.",
-                  `${budget} Already used this turn: ${state.directFilesInTurn.length} files, about ${state.directLinesInTurn} lines. Past the budget your edits are refused.`,
-                  window.checks.length && gateEnabled
-                    ? `Checks (${window.checks.length}): Fusion runs them when you call \`finish_direct\`.`
-                    : "No `checks` were given, so Fusion will verify nothing. Say so to the user unless the task is only a written note.",
-                  "When the change is complete call `finish_direct`. If it turns out larger than you thought, stop and call `handoff_to_fellow` with a plan that says what you already changed and what remains.",
-                ].join("\n"),
-              };
-            });
-          },
-        });
-
-        editor.add({
-          name: "finish_direct",
-          description:
-            "Lead-only tool. Ends direct work: Fusion runs the checks given to `work_directly` and closes editing and shell again. Failing checks keep it open so you can fix the cause.",
-          options: { codemode: false },
-          input: {
-            type: "object",
-            properties: { summary: { type: "string", description: "What you changed, briefly." } },
-            required: ["summary"],
-            additionalProperties: false,
-          },
-          async execute(args: any, toolCtx: any) {
-            const sessionID = toolCtx?.sessionID;
-            if (!sessionID) throw new Error("finish_direct requires sessionID.");
-            return withSessionLock(sessionID, async () => {
-              const state = await loadState(sessionID, { refreshModels: true });
-              if (toolCtx?.agent !== AGENT.lead || state.role !== "lead") {
-                throw new Error("finish_direct is only available in Lead mode.");
-              }
-              const window = state.direct;
-              if (!window) return { content: "No direct work is open, so there is nothing to finish. Editing and shell are closed." };
-              const root = await sessionRoot(sessionID);
-              const results = gateEnabled && window.checks.length > 0 ? await runChecks(root, window.checks, checkTimeoutMs) : [];
-              const failed = results.filter((result) => result.status === "failed");
-              if (failed.length > 0 && window.bounces < verifyRetries) {
-                const bounced: FusionState = { ...state, direct: { ...window, bounces: window.bounces + 1 }, revision: state.revision + 1 };
-                await saveState(bounced);
-                return {
-                  content: [
-                    "[FUSION DIRECT WORK — CHECKS NOT PASSED, STILL OPEN]",
-                    `${failed.length} of ${results.length} checks failed (attempt ${window.bounces + 1}/${verifyRetries}).`,
-                    ...formatCheckResults(results, (result) => result.status !== "passed"),
-                    "Fix the cause and call `finish_direct` again. If the fix is more than a small one, call `handoff_to_fellow` with what you changed and what remains.",
-                    "If the command itself is wrong for this machine (it fails the same way without your change), call `work_directly` again with corrected `checks`: that replaces them in this window. Do not stop with the check failing.",
-                  ].join("\n"),
-                };
-              }
-              const spent = directSpent(state, root);
-              const closed = closeDirectWindow(state, spent.usage);
-              await saveState(closed);
-              const notPassed = results.filter((result) => result.status !== "passed");
-              return {
-                content: [
-                  "[FUSION DIRECT WORK — CLOSED]",
-                  `You changed ${spent.usage.files.length} file(s), about ${spent.usage.lines} line(s) yourself (this turn in all: ${closed.directFilesInTurn.length} files, about ${closed.directLinesInTurn} lines; budget ${maxDirectFiles} files, ${maxDirectLines} lines).`,
-                  ...(results.length
-                    ? [
-                        `Checks run by Fusion: ${results.length - notPassed.length}/${results.length} passed${window.bounces ? ` (after ${window.bounces} failed attempt(s))` : ""}${window.checksReplaced ? ` (you replaced the checks ${window.checksReplaced} time(s) in this window)` : ""}.`,
-                        ...formatCheckResults(results, (result) => result.status !== "passed"),
-                      ]
-                    : ["No checks were run by Fusion, so nothing here is verified by it."]),
-                  ...workspaceDigest(root).summary,
-                  ...(window.requirements.length
-                    ? ["Requirements to check off against the changes before concluding:", ...window.requirements.map((item, index) => `  ${index + 1}. ${item}`)]
-                    : []),
-                  notPassed.length
-                    ? "Checks are not all passing. Do not report this as done: fix it, hand it off, or tell the user exactly what could not be verified and why."
-                    : "",
-                  "Editing and shell are closed again.",
-                ]
-                  .filter(Boolean)
-                  .join("\n"),
-              };
-            });
-          },
-        });
-      });
-    }
-
     const contextHook = await ctx.session.hook("context", async (event: any) => {
       try {
         const sessionID = event?.sessionID;
@@ -2428,46 +2068,25 @@ export default {
         const state = await loadState(sessionID);
 
         if (event.agent === AGENT.lead) {
-          const isDirectTool = directEnabled && DIRECT_TOOLS.has(event.tool);
-          if (event.tool === "shell" && !state.direct) {
-            // Looking is always open to Lead; a command with effects is Fellow's (or, with direct work, a window's).
+          if (event.tool === "shell") {
+            // Looking is always open to Lead; a command with effects is Fellow's.
             const command = rawShellCommand(event.input);
             if (state.role !== "lead") throw new Error("shell is only available in Lead mode.");
             if (!isReadOnlyShell(command)) {
               throw new Error(
-                `Lead runs read-only commands only (git log / status / diff / show / blame, ls, cat, head, tail, wc, grep, rg, and pipes between them). This one is not: ${command.replace(/\s+/g, " ").trim().slice(0, 120)}. Hand it to Fellow with handoff_to_fellow; for a small job give only \`summary\` (what to run or change, and what to report back).${directEnabled ? " Or, for a small change you will make yourself, call work_directly first." : ""}`,
+                `Lead runs read-only commands only (git log / status / diff / show / blame, ls, cat, head, tail, wc, grep, rg, and pipes between them). This one is not: ${command.replace(/\s+/g, " ").trim().slice(0, 120)}. Hand it to Fellow with handoff_to_fellow; for a small job give only \`summary\` (what to run or change, and what to report back).`,
               );
             }
             if (event?.id) inFlightCallEpoch.set(callKey(sessionID, String(event.id)), state.epoch);
             return;
           }
-          if (!leadAllowedTools.has(event.tool) && !isDirectTool) {
+          if (!leadAllowedTools.has(event.tool)) {
             throw new Error(
               `Tool "${event.tool}" is disabled in Lead mode (strict PLAN allowlist). Use read-only tools or call handoff_to_fellow first.`,
             );
           }
-          if (state.role !== "lead" && (LEAD_ONLY_TOOLS.has(event.tool) || isDirectTool)) {
+          if (state.role !== "lead" && LEAD_ONLY_TOOLS.has(event.tool)) {
             throw new Error(`${event.tool} is only available in Lead mode.`);
-          }
-          if (isDirectTool) {
-            const window = state.direct;
-            if (!window) {
-              throw new Error(
-                `Tool "${event.tool}" is closed. If this is a small, certain change you will make yourself, call work_directly first; otherwise call handoff_to_fellow.`,
-              );
-            }
-            const isNewStep = typeof event.messageID === "string" && event.messageID.length > 0 ? !window.seen.includes(event.messageID) : true;
-            if (window.steps >= maxDirectSteps && isNewStep) {
-              throw new Error(
-                `Direct-work step limit reached (${window.steps}/${maxDirectSteps}). Call finish_direct if the change is complete; otherwise call handoff_to_fellow with a plan that says what you already changed and what remains.`,
-              );
-            }
-            const spent = directSpent(state, await sessionRoot(sessionID));
-            if (spent.files > maxDirectFiles || spent.lines > maxDirectLines) {
-              throw new Error(
-                `Direct-work budget exceeded (${spent.files} files, about ${spent.lines} changed lines; the limit is ${maxDirectFiles} files, ${maxDirectLines} lines). This is no longer a small change. Stop editing: call handoff_to_fellow with a plan that says what you already changed and what remains, or call finish_direct if the change is in fact complete.`,
-              );
-            }
           }
           if (event?.id) {
             inFlightCallEpoch.set(callKey(sessionID, String(event.id)), state.epoch);
@@ -2571,27 +2190,9 @@ export default {
             event?.tool !== "execute" &&
             (event?.codemode === true || (activeExecuteCalls.get(sessionID)?.size ?? 0) > 0);
           if (isInnerCodeMode) return;
-          if (["handoff_to_fellow", "handoff_to_lead", "resume_fellow", "report_checkpoint", "work_directly", "finish_direct"].includes(event?.tool)) return;
+          if (FUSION_TOOLS.has(event?.tool)) return;
 
           const state = await loadState(sessionID);
-          if (state.role === "lead" && state.direct && DIRECT_TOOLS.has(event?.tool)) {
-            // Lead's own steps inside a direct window, one per assistant message.
-            const seen = [...state.direct.seen];
-            let steps = state.direct.steps;
-            if (typeof event.messageID === "string" && event.messageID.length > 0) {
-              if (!seen.includes(event.messageID)) {
-                seen.push(event.messageID);
-                if (seen.length > 60) seen.splice(0, seen.length - 60);
-                steps += 1;
-              }
-            } else {
-              steps += 1;
-            }
-            if (steps !== state.direct.steps) {
-              await saveState({ ...state, direct: { ...state.direct, steps, seen }, revision: state.revision + 1 }, { emit: false });
-            }
-            return;
-          }
           if (state.role !== "fellow") return;
           if (callEpoch !== undefined && callEpoch !== state.epoch) return;
 
@@ -2739,13 +2340,10 @@ export default {
 
         await withSessionLock(sessionID, async () => {
           const loaded = await loadState(sessionID);
-          const usedDirect = loaded.direct !== undefined || loaded.directWindowsInTurn !== 0 || loaded.directLinesInTurn !== 0 || loaded.directFilesInTurn.length !== 0;
           const state: FusionState =
-            loaded.handoffsInTurn !== 0 || usedDirect
-              ? { ...loaded, handoffsInTurn: 0, stalledReturns: 0, directWindowsInTurn: 0, directLinesInTurn: 0, directFilesInTurn: [], revision: loaded.revision + 1 }
+            loaded.handoffsInTurn !== 0 || loaded.stalledReturns !== 0
+              ? { ...loaded, handoffsInTurn: 0, stalledReturns: 0, revision: loaded.revision + 1 }
               : loaded;
-          // A window left open by the last turn does not carry over: the new request is judged afresh.
-          if (state !== loaded) delete state.direct;
 
           if (!returnOnUserPrompt || state.role !== "fellow") {
             if (state !== loaded) await saveState(state);
@@ -2794,27 +2392,6 @@ export default {
 
         await withSessionLock(sessionID, async () => {
           const state = await loadState(sessionID);
-          if (state.role === "lead" && state.direct) {
-            // Lead ended its turn without `finish_direct`: the checks are run anyway, and it is told only if they fail.
-            const window = state.direct;
-            const root = await sessionRoot(sessionID);
-            const results = gateEnabled && window.checks.length > 0 ? await runChecks(root, window.checks, checkTimeoutMs) : [];
-            await saveState(closeDirectWindow(state, directSpent(state, root).usage));
-            const notPassed = results.filter((result) => result.status !== "passed");
-            if (notPassed.length === 0) return;
-            await ctx.session.synthetic({
-              sessionID,
-              text: [
-                "[FUSION DIRECT WORK — ENDED WITHOUT finish_direct]",
-                `Fusion ran your checks: ${results.length - notPassed.length}/${results.length} passed.`,
-                ...formatCheckResults(results, (result) => result.status !== "passed"),
-                "Checks are not all passing. Do not leave this reported as done: open `work_directly` again for a small fix, hand it off, or tell the user exactly what could not be verified and why.",
-              ].join("\n"),
-              delivery: "steer",
-              resume: true,
-            });
-            return;
-          }
           if (state.role !== "fellow") return;
 
           // Fellow stopped without handing back. Often it wrote the tool call out as text (some models do), or simply

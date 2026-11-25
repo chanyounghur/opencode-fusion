@@ -7,11 +7,10 @@ import os from "node:os";
 import path from "node:path";
 
 function createMockOpenCode(givenOptions = {}, mockOpts = {}) {
-  // Lead only reads and plans unless a test switches direct work on (`directWork: true`), as in the plugin itself.
   // Saved settings are off too (`settingsFile: false`), so a test never reads the settings file of whoever runs it.
   // The mode is called `lead` here so that the agent ids read as the roles; the plugin's own default is `fusion`,
   // which test 16 covers.
-  const options = { directWork: false, settingsFile: false, modeName: "lead", fellowName: "fellow", ...givenOptions };
+  const options = { settingsFile: false, modeName: "lead", fellowName: "fellow", ...givenOptions };
   const agents = new Map();
   let defaultAgent = "build";
   const tools = new Map();
@@ -1239,207 +1238,6 @@ test("12. phases: skipped checkpoints are named at the end, stray files wake Lea
 
 // ---- direct work (2026-11-22): Lead makes small changes itself ----------------------------------------------
 
-test("13. direct work: closed until work_directly, counted against a budget, finished through the checks", async () => {
-  const dir = tempProject();
-  const mock = createMockOpenCode({ directWork: true, maxDirectFiles: 2, maxDirectLines: 10, maxDirectSteps: 3, maxDirectWindows: 2, verifyRetries: 1 });
-  const cleanup = await plugin.setup(mock.ctx);
-  mock.sessions.get("ses_1").location = { directory: dir };
-  const before = mock.toolBeforeHooks[0];
-  const after = mock.toolAfterHooks[0];
-  const open = mock.tools.get("work_directly");
-  const finish = mock.tools.get("finish_direct");
-  const asLead = { sessionID: "ses_1", agent: "lead" };
-  const call = (tool, id, messageID) => before({ tool, agent: "lead", sessionID: "ses_1", id, messageID, input: {} });
-  const done = (tool, id, messageID) => after({ tool, agent: "lead", sessionID: "ses_1", id, messageID, status: "completed", input: {}, result: { content: "ok" } });
-  const stored = () => mock.storage.get("fusion:ses_1");
-
-  // The prompt and the agent's rules let Lead edit, but each call still has to pass the window.
-  const lead = mock.agents.get("lead");
-  assert.match(lead.system, /work_directly/);
-  assert.doesNotMatch(lead.system, /strict read-only/);
-  assert.match(lead.system, /at most about 2 files and 10 changed lines/);
-  assert.match(lead.system, /or fix a small thing yourself with `work_directly`/);
-  assert.equal(resolvePermissionEffect(lead.permissions, "edit"), "allow");
-  assert.equal(resolvePermissionEffect(lead.permissions, "shell"), "allow");
-  assert.equal(resolvePermissionEffect(lead.permissions, "subagent"), "deny");
-  assert.equal(resolvePermissionEffect(mock.agents.get("fellow").permissions, "work_directly"), "deny");
-
-  // Closed until declared. Other mutating tools stay closed whatever happens.
-  await assert.rejects(() => call("edit", "c1", "m1"), /call work_directly first/);
-  await assert.rejects(() => call("subagent", "c2", "m1"), /disabled in Lead mode/);
-  await assert.rejects(() => open.execute({ reason: " ", files: [] }, asLead), /needs a `reason`/);
-  await assert.rejects(() => open.execute({ reason: "x", files: [] }, { sessionID: "ses_1", agent: "fellow" }), /only available in Lead mode/);
-
-  const opened = await open.execute({ reason: "one condition is wrong", files: ["a.txt"], requirements: ["조건을 고친다"], checks: [NEEDS_OK_FILE] }, asLead);
-  assert.match(opened.content, /DIRECT WORK OPEN — window 1\/2/);
-  assert.equal(mock.sessions.get("ses_1").agent, "lead");
-  assert.equal(mock.switchCalls.length, 0);                          // no handoff, no model switch
-  await call("edit", "c3", "m2");
-  fs.writeFileSync(path.join(dir, "a.txt"), "one\ntwo\n");
-  await done("edit", "c3", "m2");
-  assert.equal(stored().direct.steps, 1);
-  assert.match((await open.execute({ reason: "again", files: [] }, asLead)).content, /already open/);
-
-  // Failing checks keep the window open (once, with verifyRetries: 1) ...
-  const bounced = await finish.execute({ summary: "fixed" }, asLead);
-  assert.match(bounced.content, /CHECKS NOT PASSED, STILL OPEN/);
-  assert.ok(stored().direct);
-  // ... and passing ones close it, saying what Lead changed and which requirements to tick off.
-  fs.writeFileSync(path.join(dir, "ok.txt"), "ok\n");
-  const closed = await finish.execute({ summary: "fixed" }, asLead);
-  assert.match(closed.content, /DIRECT WORK — CLOSED/);
-  assert.match(closed.content, /You changed 2 file\(s\), about 2 line\(s\)/);
-  assert.match(closed.content, /Checks run by Fusion: 1\/1 passed \(after 1 failed attempt/);
-  assert.match(closed.content, /1\. 조건을 고친다/);
-  assert.equal(stored().direct, undefined);
-  await assert.rejects(() => call("write", "c4", "m3"), /call work_directly first/);
-  assert.match((await finish.execute({ summary: "x" }, asLead)).content, /nothing to finish/);
-
-  // A second window: the turn's total counts. A third file is over the budget, and then nothing more may be changed.
-  await open.execute({ reason: "one more line", files: ["a.txt"] }, asLead);
-  await call("edit", "c5", "m4");
-  fs.writeFileSync(path.join(dir, "third.txt"), "x\n");
-  await assert.rejects(() => call("edit", "c6", "m5"), /Direct-work budget exceeded \(3 files/);
-  await assert.rejects(() => call("shell", "c7", "m5"), /handoff_to_fellow with a plan that says what you already changed/);
-  await call("read", "c8", "m5");                                    // reading is never closed
-
-  // Handing off closes the window and keeps the count.
-  const handed = await mock.tools.get("handoff_to_fellow").execute(
-    { summary: "The rest", files: [], steps: ["finish it"], verification: [], replanIf: [], requirements: ["x"] },
-    asLead,
-  );
-  assert.match(handed.content, /direct work was closed by this handoff \(it changed 1 file\(s\), about 1 line/);
-  assert.equal(stored().direct, undefined);
-  assert.equal(stored().directFilesInTurn.length, 3);
-  await assert.rejects(() => before({ tool: "work_directly", agent: "fellow", sessionID: "ses_1", id: "c9", input: {} }), /only available in Lead mode/);
-  await mock.tools.get("handoff_to_lead").execute({ reason: "completed", summary: "done" }, { sessionID: "ses_1", agent: "fellow" });
-  await assert.rejects(() => open.execute({ reason: "again", files: [] }, asLead), /already opened 2 times this turn/);
-
-  // A new user prompt starts a new budget.
-  await mock.sessionPromptHooks[0]({ sessionID: "ses_1", prompt: { text: "next request" } });
-  assert.equal(stored().directWindowsInTurn, 0);
-  assert.equal(stored().directFilesInTurn.length, 0);
-
-  // Steps inside a window are limited: sibling calls of the last message finish, the next message is refused.
-  await open.execute({ reason: "steps", files: [] }, asLead);
-  for (const n of [1, 2, 3]) {
-    await call("shell", `s${n}`, `step${n}`);
-    await done("shell", `s${n}`, `step${n}`);
-  }
-  await call("shell", "s3b", "step3");
-  await assert.rejects(() => call("shell", "s4", "step4"), /step limit reached \(3\/3\)/);
-  // A window left open does not survive the next user prompt.
-  await mock.sessionPromptHooks[0]({ sessionID: "ses_1", prompt: { text: "another" } });
-  assert.equal(stored().direct, undefined);
-  await cleanup?.();
-
-  // The plugin's own default is off: no tools, the prompt of a Lead that never edits, edits denied by the agent's
-  // own rules. `directWork: false` is the same.
-  for (const directWork of [undefined, false]) {
-    const off = createMockOpenCode({ directWork });
-    const cleanupOff = await plugin.setup(off.ctx);
-    assert.equal(off.tools.get("work_directly"), undefined);
-    assert.equal(off.tools.get("finish_direct"), undefined);
-    assert.match(off.agents.get("lead").system, /You never change files or run anything that has effects yourself/);
-    assert.doesNotMatch(off.agents.get("lead").system, /work_directly/);
-    assert.equal(resolvePermissionEffect(off.agents.get("lead").permissions, "edit"), "deny");
-    await cleanupOff?.();
-  }
-  fs.rmSync(dir, { recursive: true, force: true });
-});
-
-test("14. direct work: after Fellow returns only Lead's own change is counted; a window left open is checked at idle", async () => {
-  const dir = tempProject();
-  const mock = createMockOpenCode({ directWork: true, maxDirectFiles: 3, maxDirectLines: 20 });
-  const cleanup = await plugin.setup(mock.ctx);
-  mock.sessions.get("ses_1").location = { directory: dir };
-  const before = mock.toolBeforeHooks[0];
-  const open = mock.tools.get("work_directly");
-  const asLead = { sessionID: "ses_1", agent: "lead" };
-  const stored = () => mock.storage.get("fusion:ses_1");
-
-  await mock.tools.get("handoff_to_fellow").execute(
-    { summary: "Big work", files: ["big.txt"], steps: ["write it"], verification: [], replanIf: [], requirements: ["x"] },
-    asLead,
-  );
-  // Fellow writes far more than the direct budget allows.
-  fs.writeFileSync(path.join(dir, "big.txt"), `${Array.from({ length: 500 }, (_, i) => `line ${i}`).join("\n")}\n`);
-  fs.writeFileSync(path.join(dir, "a.txt"), `one\n${"x\n".repeat(100)}`);
-  await mock.tools.get("handoff_to_lead").execute({ reason: "completed", summary: "done" }, { sessionID: "ses_1", agent: "fellow" });
-
-  // Lead fixes one line of it. Fellow's 600 lines are not held against Lead.
-  await open.execute({ reason: "one wrong line in Fellow's work", files: ["big.txt"], checks: [FAIL] }, asLead);
-  await before({ tool: "edit", agent: "lead", sessionID: "ses_1", id: "e1", messageID: "m1", input: {} });
-  fs.appendFileSync(path.join(dir, "big.txt"), "fixed\n");
-  await before({ tool: "edit", agent: "lead", sessionID: "ses_1", id: "e2", messageID: "m2", input: {} });
-
-  // Lead stops without finish_direct. The checks are run anyway, and because they fail it is woken.
-  await mock.sessionIdleHooks[0]({ sessionID: "ses_1", background: [] });
-  assert.equal(stored().direct, undefined);
-  assert.deepEqual(stored().directFilesInTurn, ["big.txt"]);
-  assert.equal(stored().directLinesInTurn, 1);
-  const note = mock.syntheticCalls.at(-1);
-  assert.match(note.text, /ENDED WITHOUT finish_direct/);
-  assert.match(note.text, /boom: expected 2 got 3/);
-  assert.equal(note.resume, true);
-
-  // With passing checks nothing is said, and the window is closed all the same.
-  await open.execute({ reason: "again", files: [], checks: [PASS] }, asLead);
-  const said = mock.syntheticCalls.length;
-  await mock.sessionIdleHooks[0]({ sessionID: "ses_1", background: [] });
-  assert.equal(mock.syntheticCalls.length, said);
-  assert.equal(stored().direct, undefined);
-  assert.equal(mock.sessions.get("ses_1").agent, "lead");
-
-  await cleanup?.();
-  fs.rmSync(dir, { recursive: true, force: true });
-});
-
-test("15. direct work: a wrong check command is replaced inside the open window, a limited number of times", async () => {
-  const dir = tempProject();
-  const mock = createMockOpenCode({ directWork: true, maxDirectWindows: 2, verifyRetries: 2 });
-  const cleanup = await plugin.setup(mock.ctx);
-  mock.sessions.get("ses_1").location = { directory: dir };
-  const open = mock.tools.get("work_directly");
-  const finish = mock.tools.get("finish_direct");
-  const asLead = { sessionID: "ses_1", agent: "lead" };
-  const stored = () => mock.storage.get("fusion:ses_1");
-
-  await open.execute({ reason: "one line", files: ["a.txt"], checks: [FAIL] }, asLead);
-  const bounced = await finish.execute({ summary: "done" }, asLead);
-  assert.match(bounced.content, /CHECKS NOT PASSED, STILL OPEN/);
-  assert.match(bounced.content, /call `work_directly` again with corrected `checks`/);
-
-  // The same call without checks, with no checks, or with the same checks changes nothing.
-  assert.match((await open.execute({ reason: "again", files: [] }, asLead)).content, /already open/);
-  assert.match((await open.execute({ reason: "again", files: [], checks: [] }, asLead)).content, /already open/);
-  assert.match((await open.execute({ reason: "again", files: [], checks: [FAIL] }, asLead)).content, /already open/);
-  assert.equal(stored().direct.checksReplaced, 0);
-
-  // New checks replace the old ones: no new window, the failed attempt stays counted.
-  const replaced = await open.execute({ reason: "the command was wrong", files: [], checks: [PASS] }, asLead);
-  assert.match(replaced.content, /CHECKS REPLACED, SAME WINDOW/);
-  assert.match(replaced.content, /process\.exit\(0\)/);
-  assert.equal(stored().directWindowsInTurn, 1);
-  assert.equal(stored().direct.bounces, 1);
-  assert.equal(stored().direct.checksReplaced, 1);
-  const closed = await finish.execute({ summary: "done" }, asLead);
-  assert.match(closed.content, /DIRECT WORK — CLOSED/);
-  assert.match(closed.content, /1\/1 passed \(after 1 failed attempt\(s\)\) \(you replaced the checks 1 time\(s\) in this window\)/);
-  assert.equal(stored().direct, undefined);
-
-  // Replacing is limited, so it cannot be used to get past a failure.
-  await open.execute({ reason: "second window", files: [], checks: [FAIL] }, asLead);
-  await open.execute({ reason: "r1", files: [], checks: [NEEDS_OK_FILE] }, asLead);
-  await open.execute({ reason: "r2", files: [], checks: [PASS, NEEDS_OK_FILE] }, asLead);
-  await assert.rejects(() => open.execute({ reason: "r3", files: [], checks: [PASS] }, asLead), /already replaced 2 times/);
-  assert.equal(stored().direct.checks.length, 2);
-  assert.equal(stored().directWindowsInTurn, 2);
-
-  await cleanup?.();
-  fs.rmSync(dir, { recursive: true, force: true });
-});
-
 test("16. Fusion mode: one more mode under a chosen name, a hidden Fellow, and settings saved for every project", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "fusion-settings-"));
   const file = path.join(dir, "nested", "settings.json");
@@ -1601,20 +1399,20 @@ test("16. Fusion mode: one more mode under a chosen name, a hidden Fellow, and s
   assert.match((await off.rpcRegistrations.get("fusion").handlers.setSettings({ modeName: "Other" })).error, /switched off/);
 
   // Build, Plan and other modes are not offered the tools of this plugin; the mode itself keeps them.
-  const offered = () => ({ read: {}, edit: {}, handoff_to_fellow: {}, handoff_to_lead: {}, resume_fellow: {}, report_checkpoint: {}, work_directly: {}, finish_direct: {} });
+  const offered = () => ({ read: {}, edit: {}, handoff_to_fellow: {}, handoff_to_lead: {}, resume_fellow: {}, report_checkpoint: {} });
   const asBuild = { sessionID: "ses_1", agent: "build", model: { providerID: "openai", id: "gpt-6.2-sol" }, system: [], tools: offered() };
   await mock.sessionContextHooks[0](asBuild);
   assert.deepEqual(Object.keys(asBuild.tools), ["read", "edit"]);
   const asFusion = { sessionID: "ses_1", agent: "fusion", model: { providerID: "claude-agent", id: "opus" }, system: [], tools: offered() };
   await mock.sessionContextHooks[0](asFusion);
-  assert.equal(Object.keys(asFusion.tools).length, 8);
+  assert.equal(Object.keys(asFusion.tools).length, 6);
 
   await Promise.all([cleanup?.(), cleanupRestarted?.(), cleanupSecond?.(), cleanupPinned?.(), cleanupOff?.()]);
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
 test("17. Lead reads and Fellow acts: read-only shell for Lead, a small job handed over as one sentence", async () => {
-  const mock = createMockOpenCode({ directWork: undefined });
+  const mock = createMockOpenCode();
   const cleanup = await plugin.setup(mock.ctx);
   const before = mock.toolBeforeHooks[0];
   const handoff = mock.tools.get("handoff_to_fellow");
@@ -1685,7 +1483,6 @@ test("17. Lead reads and Fellow acts: read-only shell for Lead, a small job hand
     await assert.rejects(() => shell(command), /read-only commands only/, `expected a refusal for: ${command}`);
   }
   await assert.rejects(() => shell("npm test"), /Hand it to Fellow with handoff_to_fellow; for a small job give only `summary`/);
-  await assert.rejects(() => shell("npm test"), (err) => !/work_directly/.test(err.message));
 
   // A small job is its summary and nothing else.
   await assert.rejects(() => handoff.execute({ summary: "  " }, asLead), /requires a non-empty summary/);
@@ -1704,15 +1501,4 @@ test("17. Lead reads and Fellow acts: read-only shell for Lead, a small job hand
   // Fellow keeps its whole shell.
   await shell("npm install", "fellow");
   await cleanup?.();
-
-  // With direct work on, the refusal also names the window, and inside a window the shell is whole.
-  const direct = createMockOpenCode({ directWork: true });
-  const cleanupDirect = await plugin.setup(direct.ctx);
-  const beforeDirect = direct.toolBeforeHooks[0];
-  await beforeDirect({ tool: "shell", agent: "lead", sessionID: "ses_1", id: "d1", messageID: "dm1", input: { command: "git status" } });
-  await assert.rejects(
-    () => beforeDirect({ tool: "shell", agent: "lead", sessionID: "ses_1", id: "d2", messageID: "dm2", input: { command: "npm test" } }),
-    /call work_directly first/,
-  );
-  await cleanupDirect?.();
 });
