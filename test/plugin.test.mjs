@@ -1054,7 +1054,7 @@ test("9. gate edge cases: a command that cannot run, a blocked return, a plan wi
   fs.rmSync(dir, { recursive: true, force: true });
 });
 
-test("10. no-progress stop: unfinished rounds that change nothing end further handoffs; a change resets it", async () => {
+test("10. no-progress stop: rounds of planned work that come back unfinished with nothing changed end further handoffs", async () => {
   const dir = tempProject();
   const mock = createMockOpenCode({ maxHandoffsPerTurn: 20, maxStalledReturns: 2 });
   const cleanup = await plugin.setup(mock.ctx);
@@ -1062,25 +1062,54 @@ test("10. no-progress stop: unfinished rounds that change nothing end further ha
   const toExec = mock.tools.get("handoff_to_fellow");
   const toPlan = mock.tools.get("handoff_to_lead");
   const plan = { summary: "Stall", files: [], steps: ["go"], verification: [], replanIf: [], requirements: ["x"] };
-  const round = async () => {
-    await toExec.execute(plan, { sessionID: "ses_1", agent: "lead" });
+  const stalled = () => mock.storage.get("fusion:ses_1").stalledReturns;
+  const git = (...args) => execFileSync("git", ["-C", dir, ...args], { stdio: "ignore" });
+  // One round: the work is handed over, Fellow does `during`, and comes back blocked.
+  const round = async (during = () => {}, given = plan) => {
+    await toExec.execute(given, { sessionID: "ses_1", agent: "lead" });
+    during();
     return toPlan.execute({ reason: "blocked", summary: "stuck" }, { sessionID: "ses_1", agent: "fellow" });
   };
 
-  await round();                                   // first sight of this workspace state
-  assert.equal(mock.storage.get("fusion:ses_1").stalledReturns, 0);
-  const second = await round();                    // same state again
-  assert.equal(mock.storage.get("fusion:ses_1").stalledReturns, 1);
-  assert.match(second.content, /changed nothing in the workspace \(1\/2/);
+  const first = await round();                       // nothing changed between hand-over and hand-back
+  assert.equal(stalled(), 1);
+  assert.match(first.content, /changed nothing in the workspace \(1\/2/);
 
-  fs.writeFileSync(path.join(dir, "a.txt"), "two\n");   // real progress
+  await round(() => fs.writeFileSync(path.join(dir, "a.txt"), "two\n"));   // an edit is progress
+  assert.equal(stalled(), 0);
+
+  // A commit leaves the tree as clean as before the edit, and is still progress.
   await round();
-  assert.equal(mock.storage.get("fusion:ses_1").stalledReturns, 0);
+  assert.equal(stalled(), 1);
+  await round(() => {
+    fs.writeFileSync(path.join(dir, "b.txt"), "new\n");
+    git("add", "-A");
+    git("commit", "--quiet", "-m", "work");
+  });
+  assert.equal(stalled(), 0);
+
+  // A small job (a lookup, a command to run) changes nothing by nature and is never counted.
+  await round();
+  assert.equal(stalled(), 1);
+  await round(() => {}, { summary: "Look up the ticket and report its status." });
+  assert.equal(stalled(), 0);
 
   await round();
   await round();
-  assert.equal(mock.storage.get("fusion:ses_1").stalledReturns, 2);
+  assert.equal(stalled(), 2);
   await assert.rejects(() => toExec.execute(plan, { sessionID: "ses_1", agent: "lead" }), /No progress/);
+
+  // The user's next message starts the count afresh.
+  await mock.sessionPromptHooks[0]({ sessionID: "ses_1", prompt: { text: "try another way" } });
+  assert.equal(stalled(), 0);
+  await toExec.execute(plan, { sessionID: "ses_1", agent: "lead" });
+
+  // The reason is a closed set: a near miss is read as what it means, anything else is refused, so the checks
+  // cannot be skipped by a slip of the word.
+  const done = await toPlan.execute({ reason: "Done", summary: "ok" }, { sessionID: "ses_1", agent: "fellow" });
+  assert.match(done.content, /Return reason: completed/);
+  await toExec.execute(plan, { sessionID: "ses_1", agent: "lead" });
+  await assert.rejects(() => toPlan.execute({ reason: "all good!", summary: "ok" }, { sessionID: "ses_1", agent: "fellow" }), /unknown reason/);
 
   await cleanup?.();
   fs.rmSync(dir, { recursive: true, force: true });
@@ -1420,8 +1449,18 @@ test("17. Lead reads and Fellow acts: read-only shell for Lead, a small job hand
   let n = 0;
   const shell = (command, agent = "lead") => before({ tool: "shell", agent, sessionID: "ses_1", id: `sh_${(n += 1)}`, messageID: `m_${n}`, input: { command } });
 
+  // The POSIX reading of quotes, as on macOS and Linux.
+  const shellBefore = process.env.OPENCODE_FUSION_SHELL;
+  process.env.OPENCODE_FUSION_SHELL = "posix";
+
   // Looking is open to Lead without anything being declared.
   for (const command of [
+    "git branch --contains HEAD",
+    "git branch -vv",
+    "git tag -l 'v*'",
+    "git tag -n3",
+    "git tag --points-at HEAD",
+    "TZ=UTC LC_ALL=C git log -1",
     "git log --oneline -5",
     "git status",
     'git log --all --since="3 months ago" -i --grep="rate\\|cut" --format="%h %ad %s" --date=short | head -40',
@@ -1446,6 +1485,22 @@ test("17. Lead reads and Fellow acts: read-only shell for Lead, a small job hand
 
   // Anything with effects is refused, with the way on.
   for (const command of [
+    // A name after `branch` or `tag` makes one unless a flag puts the command in list mode.
+    "git branch -v topic",
+    "git branch --sort=-committerdate topic",
+    "git tag -a v1",
+    "git tag -a v1 -m release",
+    "git tag -n3 v1",
+    // A variable in front of a command can name a program to run.
+    "GIT_EXTERNAL_DIFF=./x.sh git diff",
+    "PAGER=./x.sh git log",
+    "GIT_SSH_COMMAND=./x.sh git ls-remote origin",
+    // The shell is not a way around the question the read tool asks about these files.
+    "cat .env",
+    "head -3 config/.env.local",
+    "rg SECRET apps/web/production.env",
+    "git show HEAD:.env",
+    "git help -w log",
     "npm install",
     "yarn typecheck",
     "git switch main",
@@ -1483,6 +1538,18 @@ test("17. Lead reads and Fellow acts: read-only shell for Lead, a small job hand
     await assert.rejects(() => shell(command), /read-only commands only/, `expected a refusal for: ${command}`);
   }
   await assert.rejects(() => shell("npm test"), /Hand it to Fellow with handoff_to_fellow; for a small job give only `summary`/);
+
+  // Where the command may reach cmd.exe or PowerShell, quotes mean something else: `'` does not quote in cmd.exe and
+  // `\\` does not escape in PowerShell. Anything that depends on the difference is refused there.
+  process.env.OPENCODE_FUSION_SHELL = "windows";
+  for (const command of ["git log --oneline -5", "git status | head -3", 'rg -n "TODO|FIXME" src', "git branch -a --list 'dev/*'"]) {
+    await shell(command);
+  }
+  for (const command of ["grep -rn 'a > b' src", "echo 'x & del /q *'", 'echo "a\\" > out; rm x"', "type a^.txt"]) {
+    await assert.rejects(() => shell(command), /read-only commands only/, `expected a refusal on Windows for: ${command}`);
+  }
+  if (shellBefore === undefined) delete process.env.OPENCODE_FUSION_SHELL;
+  else process.env.OPENCODE_FUSION_SHELL = shellBefore;
 
   // A small job is its summary and nothing else.
   await assert.rejects(() => handoff.execute({ summary: "  " }, asLead), /requires a non-empty summary/);

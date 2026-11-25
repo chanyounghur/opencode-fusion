@@ -100,14 +100,17 @@ interface FusionState {
   fellowSteps: number;
   seenStepMessageIDs: string[];
   consecutiveFailures: number;
+  // The assistant message of the last counted failure: several failing calls of one step count once.
+  lastFailureStep?: string;
   lastFailedCommand?: string;
   lastNonZeroShellCommand?: string;
   activePlan?: ActivePlan;
   lastReturnReason?: string;
   // How many times this Fellow round was sent back by the verification gate.
   verifyBounces: number;
-  // Consecutive Fellow rounds that came back unclean without changing the workspace.
+  // Consecutive Fellow rounds of planned work that came back unfinished without changing the workspace.
   stalledReturns: number;
+  // The workspace's fingerprint when the current Fellow round began.
   lastWorkHash?: string;
   // The epoch in which Fellow was already asked once to hand back properly after stopping without a tool call.
   idleNudgeEpoch?: number;
@@ -231,13 +234,20 @@ const DEFAULT_AGENT_STEPS = 200;
 const MAX_SEEN_MESSAGE_IDS = 100;
 const DEFAULT_VERIFY_RETRIES = 2;
 const DEFAULT_CHECK_TIMEOUT_SECONDS = 600;
-const DEFAULT_MAX_STALLED_RETURNS = 2;
+const DEFAULT_MAX_STALLED_RETURNS = 3;
 const MAX_CHECKS = 8;
 const MAX_PHASES = 8;
 const DEFAULT_OFF_PLAN_FILES_LIMIT = 5;
 const CHECK_TAIL_CHARS = 1500;
 const ROLE_MODEL_CACHE_TTL_MS = 2000;
 const LEAD_ONLY_TOOLS = new Set(["handoff_to_fellow", "resume_fellow"]);
+// A successful call of one of these means the work moved; it clears the count of consecutive failures.
+const PROGRESS_TOOLS = new Set(["edit", "write", "patch"]);
+const HANDBACK_REASONS = new Set(["completed", "blocked", "need_replan", "user_requested"]);
+const HANDBACK_REASON_ALIASES: Record<string, string> = {
+  complete: "completed", done: "completed", finished: "completed", success: "completed", succeeded: "completed",
+  block: "blocked", stuck: "blocked", replan: "need_replan", needs_replan: "need_replan", user_request: "user_requested",
+};
 
 const BASE_LEAD_ALLOWLIST = [
   "read",
@@ -286,12 +296,33 @@ const READ_ONLY_COMMANDS = new Set([
 const READ_ONLY_GIT = new Set([
   "log", "show", "status", "diff", "blame", "rev-parse", "rev-list", "ls-files", "ls-tree", "ls-remote", "describe",
   "shortlog", "cat-file", "merge-base", "name-rev", "for-each-ref", "show-ref", "show-branch", "grep", "whatchanged",
-  "diff-tree", "count-objects", "version", "help",
+  "diff-tree", "count-objects", "version",
 ]);
-const GIT_LISTING_FLAG = /^(-a|-r|-l|-v|-vv|-n\d*|--all|--remotes|--list|--show-current|--verbose|--contains|--no-contains|--merged|--no-merged|--points-at|--sort|--format|--column|--no-column)(=|$)/;
+const GIT_LISTING_FLAG = /^(-a|-r|-l|-v|-vv|-i|--all|--remotes|--list|--show-current|--verbose|--ignore-case|--contains|--no-contains|--merged|--no-merged|--points-at|--sort|--format|--column|--no-column)(=|$)/;
+// `git tag` reads only with these: `-a` there makes an annotated tag, and `-n` counts message lines.
+const GIT_TAG_LISTING_FLAG = /^(-l|-i|-n\d*|--list|--ignore-case|--contains|--no-contains|--merged|--no-merged|--points-at|--sort|--format|--column|--no-column)(=|$)/;
+// The flags that make `git branch` / `git tag` list whatever follows. Without one of them a name creates something
+// (`git branch -v topic` makes a branch).
+const GIT_LIST_MODE_FLAG = /^(-l|--list|--contains|--no-contains|--merged|--no-merged|--points-at)(=|$)/;
+// Variables that may be set in front of a command. Others can name a program to run (GIT_EXTERNAL_DIFF, PAGER, …).
+const HARMLESS_ENV = /^(LC_[A-Z]+|LANG|LANGUAGE|TZ|TERM|COLUMNS|LINES|NO_COLOR|FORCE_COLOR|CLICOLOR|CLICOLOR_FORCE|GIT_PAGER_IN_USE)=/;
+// Files the read tool asks about first; the shell must not be a way around that.
+const GUARDED_FILE = /(^|[\\/:])(\.env(\.[^\\/:]*)?|[^\\/:]*\.env(\.[^\\/:]*)?)$/;
 
-/** A command line cut into its commands (at `|`, `&&`, `||`, `;`, new lines), each as its words. undefined: something this cannot vouch for. */
-function splitShellCommands(command: string): string[][] | undefined {
+/** Whether commands may reach cmd.exe or PowerShell. `OPENCODE_FUSION_SHELL=posix` says the shell is a POSIX one on Windows too (Git Bash). */
+function windowsShell(): boolean {
+  const forced = process.env.OPENCODE_FUSION_SHELL;
+  if (forced === "posix") return false;
+  if (forced === "windows") return true;
+  return process.platform === "win32";
+}
+
+/**
+ * A command line cut into its commands (at `|`, `&&`, `||`, `;`, new lines), each as its words. undefined: something
+ * this cannot vouch for. The quoting read here is the POSIX shell's. On Windows the command may reach cmd.exe or
+ * PowerShell, where `'` and `\"` mean something else, so there anything that depends on the difference is refused.
+ */
+function splitShellCommands(command: string, windows = windowsShell()): string[][] | undefined {
   const commands: string[][] = [];
   let words: string[] = [];
   let word = "";
@@ -313,6 +344,8 @@ function splitShellCommands(command: string): string[][] | undefined {
     if (quote) {
       if (ch === quote) quote = undefined;
       else if (quote === '"' && (ch === "`" || (ch === "$" && next === "("))) return undefined;
+      // cmd.exe does not quote with `'`, and PowerShell does not escape with `\`.
+      else if (windows && ((quote === "'" && /[&|;<>^\n]/.test(ch)) || (ch === "\\" && (next === '"' || next === "'")))) return undefined;
       else if (quote === '"' && ch === "\\" && next !== undefined) {
         word += next;
         i += 1;
@@ -323,9 +356,12 @@ function splitShellCommands(command: string): string[][] | undefined {
       quote = ch;
       inWord = true;
     } else if (ch === "\\" && next !== undefined) {
+      if (windows && (next === '"' || next === "'")) return undefined;
       word += next;
       inWord = true;
       i += 1;
+    } else if (windows && ch === "^") {
+      return undefined;
     } else if (ch === "`" || ch === "<" || (ch === "$" && next === "(")) {
       return undefined;
     } else if (ch === ">") {
@@ -371,8 +407,10 @@ function isReadOnlyGit(args: string[]): boolean {
   const positional = rest.filter((arg) => !arg.startsWith("-"));
   const flags = rest.filter((arg) => arg.startsWith("-"));
   const onlyListing = flags.every((flag) => GIT_LISTING_FLAG.test(flag));
-  // Without a listing flag, a name after `branch` or `tag` creates one.
-  if (sub === "branch" || sub === "tag") return onlyListing && (positional.length === 0 || flags.length > 0);
+  // A name after `branch` or `tag` creates one unless a flag puts the command in list mode.
+  const listMode = flags.some((flag) => GIT_LIST_MODE_FLAG.test(flag));
+  if (sub === "branch") return onlyListing && (positional.length === 0 || listMode);
+  if (sub === "tag") return flags.every((flag) => GIT_TAG_LISTING_FLAG.test(flag)) && (positional.length === 0 || listMode);
   if (sub === "remote") return rest.length === 0 || (flags.length === rest.length && onlyListing) || positional[0] === "show" || positional[0] === "get-url";
   if (sub === "stash") return positional[0] === "list" || positional[0] === "show";
   if (sub === "worktree") return positional[0] === "list";
@@ -382,14 +420,18 @@ function isReadOnlyGit(args: string[]): boolean {
 }
 
 /** true when every command on the line only looks at things. */
-function isReadOnlyShell(command: string): boolean {
+function isReadOnlyShell(command: string, windows = windowsShell()): boolean {
   if (!command.trim()) return false;
-  const commands = splitShellCommands(command);
+  const commands = splitShellCommands(command, windows);
   if (!commands || commands.length === 0) return false;
   return commands.every((words) => {
     let i = 0;
-    while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i])) i += 1;
+    while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(words[i])) {
+      if (!HARMLESS_ENV.test(words[i])) return false;
+      i += 1;
+    }
     if (i >= words.length) return true;
+    if (words.slice(i + 1).some((arg) => !arg.startsWith("-") && GUARDED_FILE.test(arg))) return false;
     const name = words[i].replace(/\\/g, "/").split("/").pop()!.toLowerCase().replace(/\.exe$/, "");
     const args = words.slice(i + 1);
     if (name === "git") return isReadOnlyGit(args);
@@ -437,13 +479,14 @@ const LEAD_PROMPT = [
 
 const FELLOW_PROMPT = [
   "You are the Fusion FELLOW responsible for focused implementation and verification.",
-  "- Follow the active `fusion.plan` in instructions strictly; make clean, minimal edits and run the specified `verification` commands.",
-  "- A plan that is only a `summary` is a small job: do exactly what it says and nothing more, then hand back with what you did or found. Quote the part of a command's output that answers the question; Lead does not see your tool results, only your hand-back.",
+  "- Carry out the active `fusion.plan` in instructions with clean, minimal edits, and run the specified `verification` commands.",
+  "- The plan is Lead's best reading, not a guarantee. If carrying out a step would go against what the user asked, against the state of the repository (it would discard commits or uncommitted work, overwrite something that exists, publish or assert something nobody verified), or against what you observe, do not carry it out: stop and call `handoff_to_lead` with `need_replan`, saying what you found. Catching this is part of your job.",
+  "- A plan that is only a `summary` is a small job: do exactly what it says and nothing more, then hand back briefly with what you did or found. Lead can see your tool results in this session, so point to them rather than repeating them.",
   "- Respect `replanIf` stop conditions and avoid blind retries after repeated failures.",
   "- You MUST finish every execution turn by calling `handoff_to_lead` (`completed`, `blocked`, or `need_replan`) with a concise summary, `changedFiles`, `verification`, and any `blockers` — never end a turn directly with plain text without handing back to Lead.",
   "- When the plan has `phases`, work on one phase at a time. When a phase is done, call `report_checkpoint` and wait for its answer before starting the next: it runs that phase's checks, and either tells you to go on or brings Lead in. The report has three places for remarks, and they are treated differently. `concerns`: a question or choice you need Lead to decide before going on. `deviations`: a departure from the plan that changes what gets built. Either of these brings Lead in, so use them when it matters and only then. `notes`: anything else worth knowing, such as what you could not verify in this environment or a small incidental fix; these are recorded for Lead without interrupting. Do not hide a real doubt in `notes`: a wrong turn carried through three phases costs the whole task. `amendments` in the plan are Lead's later corrections and override the original steps.",
-  "- Before editing, reread the user's original request and compare it with the plan's `requirements` and `steps`. If the request asks for something the plan does not cover, carry out the plan anyway and list what is missing under `missingRequirements` when you hand back (use `need_replan` instead if the gap changes the approach).",
-  "- When you hand back as `completed`, Fusion runs the plan's `checks` itself. If one fails, the handoff is refused and the output comes back to you: fix the cause and hand back again. Run the checks yourself first. If a check cannot run in this environment or the command itself is wrong, hand back with reason `blocked` and say why instead of retrying.",
+  "- Before editing, reread the user's original request and compare it with the plan's `requirements` and `steps`. If the request asks for something the plan does not cover, do what the plan covers and list what is missing under `missingRequirements` when you hand back (use `need_replan` instead if the gap changes the approach).",
+  "- When you hand back as `completed`, Fusion runs the plan's `checks` itself. If one fails, the handoff is refused and the output comes back to you: fix the cause and hand back again. You need not run them once more just before handing back. If a check cannot run in this environment or the command itself is wrong, hand back with reason `blocked` and say why instead of retrying.",
 ].join("\n");
 
 function parseModelRef(value: unknown): ModelRef | undefined {
@@ -844,7 +887,9 @@ function runCheck(root: string, check: PlanCheck, timeoutMs: number): Promise<Ch
       settled = true;
       clearTimeout(timer);
       // "Command not found" is the plan's or the environment's problem, not a defect in the work.
-      const notFound = code === 127 || code === 9009 || /is not recognized as an internal or external command|: command not found/i.test(output);
+      // Told by the exit code (127 from a POSIX shell, 9009 or cmd.exe's own message on Windows), never by words that
+      // a failing test might print itself.
+      const notFound = code === 127 || code === 9009 || (code === 1 && /is not recognized as an internal or external command/i.test(output.slice(-400)));
       finish(code === 0 ? "passed" : notFound ? "unrunnable" : "failed", code, output);
     });
   });
@@ -874,7 +919,13 @@ function workspaceDigest(root: string): { summary: string[]; hash?: string; file
   const rows = status.stdout.split("\n").filter((line) => line.trim() && !/node_modules\/|opencode\.json$/.test(line));
   const diff = git(["diff", "HEAD"]);
   const stat = git(["diff", "HEAD", "--shortstat"]);
-  const hash = createHash("sha1").update(rows.join("\n")).update(typeof diff.stdout === "string" ? diff.stdout : "").digest("hex");
+  // The commit is part of the fingerprint: a round that commits its work leaves a clean tree, which is not "nothing".
+  const head = git(["rev-parse", "HEAD"]);
+  const hash = createHash("sha1")
+    .update(typeof head.stdout === "string" ? head.stdout : "")
+    .update(rows.join("\n"))
+    .update(typeof diff.stdout === "string" ? diff.stdout : "")
+    .digest("hex");
   const summary = rows.length
     ? [`Workspace changes (${rows.length} files${typeof stat.stdout === "string" && stat.stdout.trim() ? `;${stat.stdout.trim().replace(/^\d+ files? changed,?/, "")}` : ""}):`, ...rows.slice(0, 40).map((line) => `  ${line}`), ...(rows.length > 40 ? [`  … ${rows.length - 40} more`] : [])]
     : ["Workspace changes: none"];
@@ -1307,6 +1358,7 @@ export default {
           : [],
         consecutiveFailures:
           typeof data.consecutiveFailures === "number" && data.consecutiveFailures >= 0 ? data.consecutiveFailures : 0,
+        ...(typeof data.lastFailureStep === "string" ? { lastFailureStep: data.lastFailureStep } : {}),
         ...(typeof data.lastFailedCommand === "string" ? { lastFailedCommand: data.lastFailedCommand } : {}),
         ...(typeof data.lastNonZeroShellCommand === "string"
           ? { lastNonZeroShellCommand: data.lastNonZeroShellCommand }
@@ -1455,6 +1507,7 @@ export default {
               seenStepMessageIDs: [],
               consecutiveFailures: 0,
               verifyBounces: 0,
+              lastFailureStep: undefined,
               lastFailedCommand: undefined,
               lastNonZeroShellCommand: undefined,
               ...(activePlan ? { activePlan } : {}),
@@ -1638,7 +1691,9 @@ export default {
               activePlan: plan,
               incrementHandoffs: true,
             });
-            const next: FusionState = { ...switched, phaseIndex: 0, phaseBounces: 0 };
+            const startHash = workspaceDigest(await sessionRoot(sessionID)).hash;
+            const next: FusionState = { ...switched, phaseIndex: 0, phaseBounces: 0, ...(startHash ? { lastWorkHash: startHash } : {}) };
+            if (!startHash) delete next.lastWorkHash;
             delete next.awaitingCheckpoint;
             await saveState(next);
 
@@ -1878,7 +1933,8 @@ export default {
           properties: {
             reason: {
               type: "string",
-              description: "Why returning control: completed, blocked, need_replan, or user_requested.",
+              enum: ["completed", "blocked", "need_replan", "user_requested"],
+              description: "completed: the work is done (Fusion runs the plan's checks). blocked: something outside the plan stops you. need_replan: the plan itself should change. user_requested: the user asked you to stop.",
             },
             summary: { type: "string", description: "Concise summary of work done and current state." },
             changedFiles: {
@@ -1913,8 +1969,12 @@ export default {
             if (toolCtx?.agent !== AGENT.fellow || state.role !== "fellow") {
               throw new Error("handoff_to_lead is only available in Fellow mode.");
             }
-            const reason =
-              typeof args?.reason === "string" && args.reason.trim() ? args.reason.trim() : "completed";
+            // The reason decides whether the checks run, so a near miss ("done") must not slip past them.
+            const givenReason = typeof args?.reason === "string" ? args.reason.trim().toLowerCase().replace(/[\s-]+/g, "_") : "";
+            const reason = HANDBACK_REASONS.has(givenReason) ? givenReason : HANDBACK_REASON_ALIASES[givenReason] ?? (givenReason ? undefined : "completed");
+            if (!reason) {
+              throw new Error(`handoff_to_lead: unknown reason "${String(args?.reason).slice(0, 40)}". Use one of: completed, blocked, need_replan, user_requested.`);
+            }
             const summary = typeof args?.summary === "string" ? args.summary.trim() : "";
             const changedFiles = sanitizeStringList(args?.changedFiles);
             const verification = sanitizeStringList(args?.verification);
@@ -1949,7 +2009,10 @@ export default {
 
             const digest = workspaceDigest(root);
             const unclean = reason !== "completed" || results.some((result) => result.status !== "passed");
-            const stalledReturns = unclean && digest.hash !== undefined && digest.hash === state.lastWorkHash ? state.stalledReturns + 1 : 0;
+            // A round counts as stalled when planned work came back unfinished with the workspace exactly as it was
+            // when the round began. A small job (a lookup, a command to run) changes nothing by nature and is not counted.
+            const smallJob = Boolean(plan && plan.phases.length === 0 && plan.files.length === 0 && plan.steps.length === 1 && plan.steps[0] === plan.summary);
+            const stalledReturns = unclean && !smallJob && digest.hash !== undefined && digest.hash === state.lastWorkHash ? state.stalledReturns + 1 : 0;
 
             const switched = await switchRole({
               sessionID,
@@ -1957,7 +2020,7 @@ export default {
               targetRole: "lead",
               reason,
             });
-            const next: FusionState = { ...switched, stalledReturns, ...(digest.hash ? { lastWorkHash: digest.hash } : {}) };
+            const next: FusionState = { ...switched, stalledReturns };
             delete next.awaitingCheckpoint;
             await saveState(next);
 
@@ -1998,7 +2061,7 @@ export default {
                   ? "Checks are not all passing. Do not report this as done: hand off again with every remaining issue in one plan, or tell the user exactly what could not be verified and why."
                   : "",
                 stalledReturns > 0
-                  ? `Note: this round changed nothing in the workspace (${stalledReturns}/${maxStalledReturns} before further handoffs are refused).`
+                  ? `Note: this round came back unfinished and changed nothing in the workspace (${stalledReturns}/${maxStalledReturns} before further handoffs are refused in this turn).`
                   : "",
               ]
                 .filter(Boolean)
@@ -2210,8 +2273,16 @@ export default {
           }
 
           let consecutiveFailures = state.consecutiveFailures;
+          let lastFailureStep = state.lastFailureStep;
           let lastFailedCommand = state.lastFailedCommand;
           let lastNonZeroShellCommand = state.lastNonZeroShellCommand;
+          const stepID = typeof event.messageID === "string" && event.messageID.length > 0 ? event.messageID : undefined;
+          // Parallel calls of one step that all fail are one failure, not several.
+          const countFailure = () => {
+            if (stepID && stepID === lastFailureStep) return;
+            consecutiveFailures += 1;
+            lastFailureStep = stepID;
+          };
 
           const meta =
             event?.result && typeof event.result === "object" && event.result.metadata
@@ -2220,7 +2291,7 @@ export default {
           const isBackgroundRunning = event?.tool === "shell" && isBackgroundShellResult(meta);
 
           if (event.status === "error") {
-            consecutiveFailures += 1;
+            countFailure();
             if (event.tool === "shell") {
               const cmd = extractShellCommand(event.input);
               if (cmd) {
@@ -2232,7 +2303,7 @@ export default {
             // Neutral: starting a background shell must neither increment nor clear prior failures.
           } else if (event.tool === "execute") {
             if (isCodeModeFailure(event.result)) {
-              consecutiveFailures += 1;
+              countFailure();
               lastFailedCommand = "execute (Code Mode failure)";
             } else {
               consecutiveFailures = 0;
@@ -2251,7 +2322,7 @@ export default {
               if (benignExitOne) {
                 lastNonZeroShellCommand = cmd || lastNonZeroShellCommand;
               } else {
-                consecutiveFailures += 1;
+                countFailure();
                 if (cmd) {
                   lastFailedCommand = cmd;
                   lastNonZeroShellCommand = cmd;
@@ -2261,10 +2332,12 @@ export default {
               consecutiveFailures = 0;
               lastNonZeroShellCommand = undefined;
             }
-          } else {
+          } else if (PROGRESS_TOOLS.has(event.tool)) {
             consecutiveFailures = 0;
             lastNonZeroShellCommand = undefined;
           }
+          // Anything else (a read, a search) says nothing about whether the work is getting anywhere: it neither adds
+          // to the count nor clears it.
 
           const updated: FusionState = {
             ...state,
@@ -2272,6 +2345,7 @@ export default {
             fellowSteps,
             seenStepMessageIDs: seen,
             consecutiveFailures,
+            ...(lastFailureStep !== undefined ? { lastFailureStep } : {}),
             ...(lastFailedCommand !== undefined ? { lastFailedCommand } : {}),
             ...(lastNonZeroShellCommand !== undefined ? { lastNonZeroShellCommand } : {}),
           };
