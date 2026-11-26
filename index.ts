@@ -36,7 +36,8 @@
  *   untracked files, history on a remote) is stopped when Fellow runs it, judged against the repository as it is.
  *   Only the user lifts it, once, with `/fusion-approve`.
  * - Evidence with the report: a checkpoint or a hand-back carries what changed since the work began (commits,
- *   diffstat, the first part of the diff), so Lead reviews the change itself and not a description of it.
+ *   diffstat, the first part of the diff), so Lead reviews the change itself and not a description of it. The work is
+ *   measured wherever it happens: every worktree of the repository, and other repositories Fellow ran commands in.
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -78,6 +79,8 @@ interface TreeBase {
   path: string;
   ref: string;
   untracked: string[];
+  // true: only the HEAD was recorded (a worktree the session had not worked in).
+  light?: boolean;
 }
 
 /** Everywhere the work can be, at one moment: the worktrees of the session's repository and any other repository Fellow ran commands in. */
@@ -142,8 +145,9 @@ interface FusionState {
   // The workspace when the current round began, and when the current phase began: what Lead is shown is measured from these.
   roundBase?: WorkBase;
   phaseBase?: WorkBase;
-  // Folders outside the session's own repository in which Fellow ran commands during this round.
-  roundDirs?: string[];
+  // The trees this session has worked in besides its own folder (a worktree made for the task, another repository).
+  // These are measured in full; the repository's other worktrees are only watched for a new commit.
+  workDirs?: string[];
   // Which phase Fellow is on (0-based), and how often its checkpoint was sent back by failing checks.
   phaseIndex: number;
   phaseBounces: number;
@@ -327,7 +331,7 @@ const FORBIDDEN_EXTRA_LEAD_TOOLS = new Set([
 const READ_ONLY_COMMANDS = new Set([
   "ls", "dir", "pwd", "cd", "cat", "type", "head", "tail", "wc", "sort", "uniq", "cut", "tr", "nl", "column",
   "file", "stat", "du", "tree", "which", "where", "echo", "true", "basename", "dirname", "realpath",
-  "grep", "rg", "egrep", "fgrep", "findstr", "diff", "cmp", "jq",
+  "grep", "rg", "egrep", "fgrep", "findstr", "diff", "cmp", "jq", "sed", "find", "fd",
 ]);
 // Commands the scout may not run at all: they exist to change or remove things.
 const SCOUT_REFUSED_COMMANDS = new Set(["rm", "rmdir", "mv", "del", "erase", "rd", "move", "ren", "rename", "chmod", "chown", "truncate", "dd", "mkfs", "sudo", "kill", "pkill", "taskkill", "brew", "apt", "apt-get", "choco", "winget"]);
@@ -478,6 +482,15 @@ function isReadOnlyShell(command: string, windows = windowsShell()): boolean {
     if ((name === "sort" || name === "tree") && args.some((arg) => arg === "-o" || arg.startsWith("--output"))) return false;
     if (name === "uniq" && args.filter((arg) => !arg.startsWith("-")).length > 1) return false;
     if (name === "rg" && args.some((arg) => arg === "--pre" || arg.startsWith("--pre="))) return false;
+    // `sed` only to print lines (`sed -n 40,60p file`): any other script can write files or edit in place.
+    if (name === "sed") {
+      const flags = args.filter((arg) => arg.startsWith("-"));
+      const script = args.find((arg) => !arg.startsWith("-"));
+      if (!flags.every((flag) => /^-[nEr]+$/.test(flag)) || !script || !/^(\d+|\$)(,(\d+|\$|\+\d+))?p$/.test(script)) return false;
+    }
+    // `find` and `fd` to list, never to run or delete what they find.
+    if (name === "find" && args.some((arg) => /^-(delete|exec|execdir|ok|okdir|fprint|fprint0|fprintf|fls)$/.test(arg))) return false;
+    if (name === "fd" && args.some((arg) => /^(-x|-X|--exec|--exec-batch)$/.test(arg))) return false;
     return true;
   });
 }
@@ -505,10 +518,11 @@ const LEAD_PROMPT = [
   "You are the Fusion LEAD: you read, decide how the work gets done, and review the result. You are the stronger and dearer model; Fellow is the cheaper one that does all the editing and all the running. You never change files or run anything that has effects yourself.",
   "- Inspect with read-only tools (read, glob, grep, webfetch, websearch, question, skill, session read/search, worktree list) and read-only shell commands (git log / status / diff / show / blame / branch --list, ls, cat, head, tail, wc, grep, rg, and pipes between them). Any other shell command is refused.",
   "- Looking things up goes to the scout: call the `subagent` tool with agent `" + SCOUT_PLACEHOLDER + "`. Use it whenever only the answer matters and not the raw material: a chat thread, a ticket, logs, a web page, frames of a video, anything behind tools you do not have (Code Mode `execute`, MCP tools), and finding out where something lives in the code or how a wide area of it works. The scout starts with none of this conversation, so the task you give it must stand alone: what to find, where to look, what to report. It runs in the background on the cheaper model and you are woken with a short report; start several at once when the questions are independent, then end your response and wait. Its raw material never enters this conversation, which is the point: everything you read yourself is reread, at your price and at Fellow's, on every later step. Read files yourself when you need their exact text to write the plan (the few files that will change), not to explore.",
+  "- Say what you did not see. When the work rests on something you could not look at yourself (a design file that would not open, a ticket, a screenshot, a scout's report that says it could not reach something), tell the user before you hand the work over: what you could not see, what you are assuming in its place, and which parts of the result depend on that. Do not describe work as matching a design, a spec or a request that nobody actually read, and do not let a later summary upgrade 'looked at a screenshot' into 'matches the design'.",
   "- Everything that changes something goes to Fellow through `handoff_to_fellow`, however small: edits, installs, builds, tests, dev servers, screenshots, commits, pushes, deploys, pull requests. Never attempt edits, Code Mode execute, or worktree/session mutations yourself, and start no subagent other than the scout. Do not do a job in pieces through your own tools to avoid a handoff.",
   "- A handoff comes in two sizes. Small job (a command or two to run and report, a change of a few lines that you can state exactly): give only `summary` — what to do and what to report back, in one to three sentences — plus `checks` when a command can confirm it. Write no steps, files or requirements for a small job. Larger work: give `summary`, target `files`, ordered `steps`, `requirements`, `checks`, `verification` notes and explicit `replanIf` stop conditions.",
   "- `requirements`: list every distinct thing the user asked for, one item each, close to the user's own words. Include asides and half-stated wishes (\"…도 두고\", \"while you're at it\"). When a phrase can be read two ways, keep it and add your reading in parentheses; never drop a request because it is vague. Every item needs a step that delivers it.",
-  "- `checks`: the commands Fusion itself runs when Fellow reports completion (type check or build, and the relevant tests). Each entry is one bare command with an optional `cwd` relative to the project root: no commentary, no `cd`, exit code 0 means pass. If dependencies are missing, add a step that installs them rather than leaving a check out. Failing checks go back to Fellow without waking you.",
+  "- `checks`: the commands Fusion itself runs when Fellow reports completion (type check or build, and the relevant tests). Each entry is one bare command with an optional `cwd` (relative to the project root; when the work is done in a separate worktree, the absolute path of the folder there, since checks run in the project root otherwise): no commentary, no `cd`, exit code 0 means pass. If dependencies are missing, add a step that installs them rather than leaving a check out. Failing checks go back to Fellow without waking you.",
   "- For each new behaviour that no existing test covers (especially failure paths), include a step that adds a test for it.",
   "- `phases`: divide work that is long, or that rests on a decision which could be wrong, into 2 to 5 phases, each with its own `steps` and `checks`. Put the decision most likely to be wrong in the first phase, so it is looked at before more work is built on it. Mark a phase `review: \"always\"` when you want to see its result yourself whatever happens; leave the others `\"auto\"` and you are woken only if a check fails, Fellow reports a concern or a departure from the plan, or files outside the plan were touched. Small work stays one piece: give `steps` and no `phases`.",
   "- At a checkpoint you get Fellow's report, the check results and what changed. Answer with `resume_fellow`: `continue` to move on, or `adjust` with short notes when this phase needs fixing. Do not rewrite the plan unless the approach itself has to change (then use `handoff_to_fellow`).",
@@ -1076,16 +1090,21 @@ function killProcessTree(pid: number | undefined) {
 }
 
 /** Runs one check in the project folder and reports how it ended. Never throws. */
-function runCheck(root: string, check: PlanCheck, timeoutMs: number): Promise<CheckResult> {
+function runCheck(root: string, check: PlanCheck, timeoutMs: number, trees: string[] = []): Promise<CheckResult> {
   return new Promise((resolve) => {
     const started = Date.now();
     const base = { command: check.command, ...(check.cwd ? { cwd: check.cwd } : {}) };
     const finish = (status: CheckResult["status"], exitCode: number | null, text: string) =>
       resolve({ ...base, status, exitCode, seconds: Math.round((Date.now() - started) / 1000), tail: text.trim().slice(-CHECK_TAIL_CHARS) });
-    // A check may not leave the project folder.
-    const cwd = check.cwd ? `${root}/${check.cwd}`.replace(/\\/g, "/") : root;
-    if (check.cwd && (/^([A-Za-z]:|[\\/])/.test(check.cwd) || check.cwd.split(/[\\/]/).includes(".."))) {
-      return finish("unrunnable", null, `cwd must be a folder inside the project: ${check.cwd}`);
+    // A check runs inside the project, or inside another tree the work is done in (a worktree of the repository).
+    const cwd = (check.cwd ? nodePath.resolve(root, check.cwd) : root).replace(/\\/g, "/");
+    const inside = (folder: string) => {
+      const base = nodePath.resolve(folder).replace(/\\/g, "/").replace(/\/+$/, "");
+      const fold = (value: string) => (process.platform === "win32" ? value.toLowerCase() : value);
+      return fold(cwd) === fold(base) || fold(cwd).startsWith(`${fold(base)}/`);
+    };
+    if (check.cwd && ![root, ...trees].some(inside)) {
+      return finish("unrunnable", null, `cwd must be a folder inside the project or one of its worktrees: ${check.cwd}`);
     }
     let output = "";
     let settled = false;
@@ -1125,9 +1144,11 @@ function runCheck(root: string, check: PlanCheck, timeoutMs: number): Promise<Ch
   });
 }
 
-async function runChecks(root: string, checks: PlanCheck[], timeoutMs: number): Promise<CheckResult[]> {
+async function runChecks(root: string, checks: PlanCheck[], timeoutMs: number, extra: string[] = []): Promise<CheckResult[]> {
   const results: CheckResult[] = [];
-  for (const check of checks) results.push(await runCheck(root, check, timeoutMs));
+  const full = checks.some((check) => check.cwd) ? workTrees(root, extra) : [];
+  const trees = full.length ? [...full, ...otherWorktrees(root, full).map((tree) => tree.path)] : [];
+  for (const check of checks) results.push(await runCheck(root, check, timeoutMs, trees));
   return results;
 }
 
@@ -1147,6 +1168,7 @@ const IGNORED_ROW = /node_modules\/|opencode\.json$/;
 
 const GIT_REF = /^[0-9a-f]{7,64}$/;
 const MAX_TREES = 12;
+const MAX_LIGHT_TREES = 40;
 
 function normalizeWorkBase(raw: unknown): WorkBase | undefined {
   if (!raw || typeof raw !== "object") return undefined;
@@ -1158,8 +1180,8 @@ function normalizeWorkBase(raw: unknown): WorkBase | undefined {
     if (!item || typeof item !== "object") continue;
     const tree = item as Record<string, unknown>;
     if (typeof tree.ref !== "string" || !GIT_REF.test(tree.ref)) continue;
-    trees.push({ path: typeof tree.path === "string" ? tree.path : "", ref: tree.ref, untracked: sanitizeStringList(tree.untracked).slice(0, 400) });
-    if (trees.length >= MAX_TREES) break;
+    trees.push({ path: typeof tree.path === "string" ? tree.path : "", ref: tree.ref, untracked: sanitizeStringList(tree.untracked).slice(0, 400), ...(tree.light === true ? { light: true } : {}) });
+    if (trees.length >= MAX_TREES + MAX_LIGHT_TREES) break;
   }
   return trees.length ? { trees } : undefined;
 }
@@ -1179,9 +1201,9 @@ function samePath(a: string, b: string): boolean {
 }
 
 /**
- * Every folder the work of a session can be in: the session's own repository, its other worktrees (work is often done
- * in one made for the task, next to the folder the session was opened in), and any other repository named in `extra`.
- * The session's own tree comes first.
+ * The trees the session works in: its own repository first, then the folders named in `extra` (a worktree made for the
+ * task, another repository). These are measured in full. Measuring costs several git calls per tree, and in a large
+ * repository each can take seconds, so it is not done for every worktree there is.
  */
 function workTrees(root: string, extra: string[] = []): string[] {
   const out: string[] = [];
@@ -1190,12 +1212,53 @@ function workTrees(root: string, extra: string[] = []): string[] {
     if (full && !out.some((known) => samePath(known, full)) && out.length < MAX_TREES) out.push(full);
   };
   add(gitText(root, ["rev-parse", "--show-toplevel"]) || root);
-  for (const line of gitText(root, ["worktree", "list", "--porcelain"]).split("\n")) {
-    if (line.startsWith("worktree ")) add(line.slice("worktree ".length).trim());
-  }
   for (const dir of extra) {
     const top = gitText(dir, ["rev-parse", "--show-toplevel"]);
     if (top) add(top);
+  }
+  return out;
+}
+
+/** The repository's worktrees that are not among `full`, each with its HEAD. One git call, whatever their number. */
+function otherWorktrees(root: string, full: string[]): Array<{ path: string; head: string }> {
+  const out: Array<{ path: string; head: string }> = [];
+  let current: { path: string; head: string } | undefined;
+  for (const line of gitText(root, ["worktree", "list", "--porcelain"]).split("\n")) {
+    if (line.startsWith("worktree ")) {
+      current = { path: nodePath.resolve(line.slice("worktree ".length).trim()).replace(/\\/g, "/"), head: "" };
+      if (!full.some((tree) => samePath(tree, current!.path)) && out.length < MAX_LIGHT_TREES) out.push(current);
+    } else if (line.startsWith("HEAD ") && current) current.head = line.slice("HEAD ".length).trim();
+  }
+  return out.filter((tree) => GIT_REF.test(tree.head));
+}
+
+/** The folder of the tree `dir` belongs to, when that is not one already known. Used to notice work outside the session's own folder. */
+function treeOutside(dir: string, known: string[]): string | undefined {
+  const full = nodePath.resolve(dir).replace(/\\/g, "/");
+  const fold = (value: string) => (process.platform === "win32" ? value.toLowerCase() : value);
+  if (known.some((tree) => fold(full) === fold(tree) || fold(full).startsWith(`${fold(tree).replace(/\/+$/, "")}/`))) return undefined;
+  const top = gitText(full, ["rev-parse", "--show-toplevel"]);
+  if (!top) return undefined;
+  const tree = nodePath.resolve(top).replace(/\\/g, "/");
+  return known.some((entry) => samePath(entry, tree)) ? undefined : tree;
+}
+
+/** The folders a command line names as where it works: `cd X`, `git -C X`, `yarn --cwd X`, `npm --prefix X`. */
+function commandFolders(command: string, runsIn: string): string[] {
+  const lines = splitShellCommands(command.replace(/\d?>>?\s*("[^"]*"|'[^']*'|[^\s|;&]+)/g, " "), false) ?? [command.trim().split(/\s+/)];
+  const out: string[] = [];
+  let cwd = runsIn;
+  for (const words of lines) {
+    if (words[0] === "cd" && words[1]) {
+      cwd = nodePath.resolve(cwd, words[1]);
+      out.push(cwd);
+      continue;
+    }
+    for (let i = 0; i < words.length; i += 1) {
+      const inline = /^--(cwd|prefix)=(.+)$/.exec(words[i]);
+      if (inline) out.push(nodePath.resolve(cwd, inline[2]));
+      else if ((words[i] === "-C" || words[i] === "--cwd" || words[i] === "--prefix") && words[i + 1]) out.push(nodePath.resolve(cwd, words[i + 1]));
+    }
   }
   return out;
 }
@@ -1207,19 +1270,23 @@ function untrackedIn(tree: string): string[] {
 /** Records the work as it is, without touching it: `git stash create` writes a tree's uncommitted state as a commit and changes nothing. */
 function snapshotWork(root: string, extra: string[] = []): WorkBase | undefined {
   const trees: TreeBase[] = [];
-  for (const tree of workTrees(root, extra)) {
+  const full = workTrees(root, extra);
+  for (const tree of full) {
     const ref = gitText(tree, ["stash", "create"]) || gitText(tree, ["rev-parse", "HEAD"]);
     if (!GIT_REF.test(ref)) continue;
     trees.push({ path: tree, ref, untracked: untrackedIn(tree).slice(0, 400) });
   }
-  return trees.length ? { trees } : undefined;
+  if (trees.length === 0) return undefined;
+  for (const other of otherWorktrees(root, full)) trees.push({ path: other.path, ref: other.head, untracked: [], light: true });
+  return { trees };
 }
 
-/** One value for the state of all the work: it changes when any tree gets a commit, an edit, or a new file. */
+/** One value for the state of all the work: it changes when a tree the session works in gets a commit, an edit or a new file, or any other worktree a commit. */
 function workFingerprint(root: string, extra: string[] = []): string | undefined {
   const hash = createHash("sha1");
   let seen = 0;
-  for (const tree of workTrees(root, extra)) {
+  const full = workTrees(root, extra);
+  for (const tree of full) {
     const status = gitIn(tree, ["status", "--porcelain", "--untracked-files=all"]);
     if (status.status !== 0 || typeof status.stdout !== "string") continue;
     seen += 1;
@@ -1229,39 +1296,46 @@ function workFingerprint(root: string, extra: string[] = []): string | undefined
       .update(status.stdout.split("\n").filter((line) => line.trim() && !IGNORED_ROW.test(line)).join("\n"))
       .update(gitText(tree, ["diff", "HEAD"], 64 * 1024 * 1024));
   }
-  return seen > 0 ? hash.digest("hex") : undefined;
+  if (seen === 0) return undefined;
+  for (const other of otherWorktrees(root, full)) hash.update(other.path).update(other.head);
+  return hash.digest("hex");
 }
 
 /**
- * What changed since `base`, in every tree: commits made, a diffstat, the files that are new, and the first part of the
- * diff itself. This is what Lead reviews from, so it is measured from the start of the work under review and does not
- * repeat whatever was already lying there before. A worktree made during the work is measured from the commit it was
- * made at.
+ * What changed since `base`: commits made, a diffstat, the files that are new, and the first part of the diff itself.
+ * This is what Lead reviews from, so it is measured from the start of the work under review and does not repeat
+ * whatever was already lying there before. The trees the session works in are compared in full. Another worktree is
+ * looked at when it is new or its HEAD has moved; one made during the work is measured from the commit it was made at.
+ * `touched` names the trees outside the known ones where something changed, so they are measured in full from then on.
  */
-function changeEvidence(root: string, base: WorkBase | undefined, extra: string[] = []): { lines: string[]; files: string[] } {
+function changeEvidence(root: string, base: WorkBase | undefined, extra: string[] = []): { lines: string[]; files: string[]; touched: string[] } {
   if (!base) {
     const digest = workspaceDigest(root);
-    return { lines: digest.summary, files: digest.files };
+    return { lines: digest.summary, files: digest.files, touched: [] };
   }
-  const now = workTrees(root, extra);
-  const own = now[0] ?? root;
+  const full = workTrees(root, extra);
+  const own = full[0] ?? root;
   const before = base.trees.map((tree) => ({ ...tree, path: tree.path || own }));
+  const others = otherWorktrees(root, full);
   const body: string[] = [];
   const files: string[] = [];
+  const touched: string[] = [];
   let commitCount = 0;
   let room = EVIDENCE_PREVIEW_CHARS;
-  for (const tree of now) {
+  const look = (tree: string, known: boolean) => {
     const was = before.find((entry) => samePath(entry.path, tree));
     // A tree that was not there when the work began is measured from where it was made: the oldest entry of its own HEAD log.
     const baseRef = was?.ref ?? gitText(tree, ["reflog", "show", "--format=%H", "HEAD"]).split("\n").filter(Boolean).at(-1) ?? "";
-    if (!GIT_REF.test(baseRef)) continue;
+    if (!GIT_REF.test(baseRef)) return;
     const commits = gitText(tree, ["log", "--oneline", "-n", "12", `${baseRef}..HEAD`]).split("\n").filter(Boolean);
     const changed = gitText(tree, ["diff", "--name-only", baseRef]).split("\n").filter((file) => file && !IGNORED_ROW.test(file));
-    const known = new Set(was?.untracked ?? []);
-    const fresh = untrackedIn(tree).filter((file) => !known.has(file));
+    // For a tree only its HEAD was recorded for, files git does not know cannot be told apart from older ones.
+    const knownFiles = new Set(was?.untracked ?? []);
+    const fresh = was?.light ? [] : untrackedIn(tree).filter((file) => !knownFiles.has(file));
+    if (!known) touched.push(tree);
     if (commits.length === 0 && changed.length === 0 && fresh.length === 0) {
       if (!was) body.push(`In ${tree}, a worktree made during this work: nothing changed yet.`);
-      continue;
+      return;
     }
     files.push(...changed, ...fresh);
     commitCount += commits.length;
@@ -1301,13 +1375,18 @@ function changeEvidence(root: string, base: WorkBase | undefined, extra: string[
         // a folder, or gone again
       }
     }
+  };
+  for (const tree of full) look(tree, true);
+  for (const other of others) {
+    const was = before.find((entry) => samePath(entry.path, other.path));
+    if (!was || was.ref !== other.head || !was.light) look(other.path, false);
   }
   for (const entry of before) {
-    if (!now.some((tree) => samePath(tree, entry.path))) body.push(`A worktree that was there when this work began is gone: ${entry.path}`);
+    if (!full.some((tree) => samePath(tree, entry.path)) && !others.some((tree) => samePath(tree.path, entry.path))) body.push(`A worktree that was there when this work began is gone: ${entry.path}`);
   }
-  if (body.length === 0) return { lines: ["Changes since this work began: none."], files };
-  if (files.length === 0 && commitCount === 0) return { lines: ["Changes since this work began: none in any file.", ...body], files };
-  return { lines: [`Changes since this work began (${files.length} file(s)${commitCount ? `, ${commitCount} commit(s)` : ""}):`, ...body], files };
+  if (body.length === 0) return { lines: ["Changes since this work began: none."], files, touched };
+  if (files.length === 0 && commitCount === 0) return { lines: ["Changes since this work began: none in any file.", ...body], files, touched };
+  return { lines: [`Changes since this work began (${files.length} file(s)${commitCount ? `, ${commitCount} commit(s)` : ""}):`, ...body], files, touched };
 }
 
 /** What the workspace looks like now: a short change summary for Lead and a fingerprint to notice rounds that changed nothing. */
@@ -1798,7 +1877,7 @@ export default {
         ...(typeof data.approvedRisk === "string" ? { approvedRisk: data.approvedRisk } : {}),
         ...(normalizeWorkBase(data.roundBase) ? { roundBase: normalizeWorkBase(data.roundBase) } : {}),
         ...(normalizeWorkBase(data.phaseBase) ? { phaseBase: normalizeWorkBase(data.phaseBase) } : {}),
-        ...(sanitizeStringList(data.roundDirs).length ? { roundDirs: sanitizeStringList(data.roundDirs).slice(0, 12) } : {}),
+        ...(sanitizeStringList(data.workDirs).length ? { workDirs: sanitizeStringList(data.workDirs).slice(0, 12) } : {}),
         phaseIndex: typeof data.phaseIndex === "number" && data.phaseIndex >= 0 ? data.phaseIndex : 0,
         phaseBounces: typeof data.phaseBounces === "number" && data.phaseBounces >= 0 ? data.phaseBounces : 0,
         ...(typeof data.awaitingCheckpoint === "number" ? { awaitingCheckpoint: data.awaitingCheckpoint } : {}),
@@ -1961,6 +2040,22 @@ export default {
       return next;
     }
 
+    /** Remembers the trees outside the session's own folder that Fellow works in, so they are measured from then on. */
+    async function noteWorkFolders(state: FusionState, root: string, folders: string[]) {
+      let known: string[] | undefined;
+      let added = false;
+      for (const folder of folders) {
+        if (samePath(folder, root)) continue;
+        known ??= workTrees(root, state.workDirs);
+        const tree = treeOutside(folder, known);
+        if (!tree) continue;
+        known.push(tree);
+        state.workDirs = [...(state.workDirs ?? []), tree].slice(-MAX_TREES);
+        added = true;
+      }
+      if (added) await saveState({ ...state, revision: state.revision + 1 }, { emit: false });
+    }
+
     async function sessionRoot(sessionID: string): Promise<string> {
       const ses = await ctx.session.get({ sessionID }).catch(() => undefined);
       return ses?.location?.directory ?? ses?.directory ?? process.cwd();
@@ -1972,13 +2067,13 @@ export default {
         const ses = await ctx.session.get({ sessionID }).catch(() => undefined);
         const root: string = ses?.location?.directory ?? ses?.directory ?? process.cwd();
         const checks = allPlanChecks(state.activePlan);
-        const lines = [...changeEvidence(root, state.roundBase, state.roundDirs).lines];
+        const lines = [...changeEvidence(root, state.roundBase, state.workDirs).lines];
         if (checks.length === 0) return lines;
         if (!gateEnabled || !options.runPlanChecks) {
           lines.push(`The plan's ${checks.length} check(s) were NOT run by Fusion on this return. Nothing here is verified.`);
           return lines;
         }
-        const results = await runChecks(root, checks, checkTimeoutMs);
+        const results = await runChecks(root, checks, checkTimeoutMs, state.workDirs);
         const passed = results.filter((result) => result.status === "passed").length;
         lines.push(`Checks run by Fusion: ${passed}/${results.length} passed.`, ...formatCheckResults(results, (result) => result.status !== "passed"));
         if (passed < results.length) lines.push("Checks are not all passing. Do not report this as done.");
@@ -2055,7 +2150,7 @@ export default {
                 type: "object",
                 properties: {
                   command: { type: "string", description: "One bare command; exit code 0 means pass. No commentary, no cd." },
-                  cwd: { type: "string", description: "Folder to run in, relative to the project root. Omit for the root." },
+                  cwd: { type: "string", description: "Folder to run in: relative to the project root, or the absolute path of a folder in the worktree the work is done in. Omit for the project root." },
                 },
                 required: ["command"],
                 additionalProperties: false,
@@ -2138,15 +2233,14 @@ export default {
               incrementHandoffs: true,
             });
             const startRoot = await sessionRoot(sessionID);
-            const startHash = workFingerprint(startRoot);
-            const startBase = snapshotWork(startRoot);
+            const startHash = workFingerprint(startRoot, state.workDirs);
+            const startBase = snapshotWork(startRoot, state.workDirs);
             const next: FusionState = { ...switched, phaseIndex: 0, phaseBounces: 0, ...(startHash ? { lastWorkHash: startHash } : {}), ...(startBase ? { roundBase: startBase, phaseBase: startBase } : {}) };
             if (!startHash) delete next.lastWorkHash;
             if (!startBase) {
               delete next.roundBase;
               delete next.phaseBase;
             }
-            delete next.roundDirs;
             delete next.awaitingCheckpoint;
             await saveState(next);
 
@@ -2233,7 +2327,7 @@ export default {
 
             const ses = await ctx.session.get({ sessionID }).catch(() => undefined);
             const root: string = ses?.location?.directory ?? ses?.directory ?? process.cwd();
-            const results = gateEnabled && phase.checks.length > 0 ? await runChecks(root, phase.checks, checkTimeoutMs) : [];
+            const results = gateEnabled && phase.checks.length > 0 ? await runChecks(root, phase.checks, checkTimeoutMs, state.workDirs) : [];
             const failed = results.filter((result) => result.status === "failed");
             if (failed.length > 0 && state.phaseBounces < verifyRetries) {
               const bounced: FusionState = { ...state, phaseBounces: state.phaseBounces + 1, revision: state.revision + 1 };
@@ -2248,7 +2342,7 @@ export default {
               };
             }
 
-            const evidence = changeEvidence(root, state.phaseBase ?? state.roundBase, state.roundDirs);
+            const evidence = changeEvidence(root, state.phaseBase ?? state.roundBase, state.workDirs);
             const strays = offPlanFiles(evidence.files, plan.files);
             const notPassed = results.filter((result) => result.status !== "passed");
             const reasons = [
@@ -2266,8 +2360,9 @@ export default {
 
             if (reasons.length === 0) {
               // Nothing calls for Lead: go straight on. This is the common case and costs no Lead call.
-              const nextBase = snapshotWork(root, state.roundDirs);
-              const advanced: FusionState = { ...state, activePlan: notedPlan, phaseIndex: index + 1, phaseBounces: 0, revision: state.revision + 1, ...(nextBase ? { phaseBase: nextBase } : {}) };
+              const seenDirs = evidence.touched.length ? [...(state.workDirs ?? []), ...evidence.touched].slice(-MAX_TREES) : state.workDirs;
+              const nextBase = snapshotWork(root, seenDirs);
+              const advanced: FusionState = { ...state, activePlan: notedPlan, phaseIndex: index + 1, phaseBounces: 0, revision: state.revision + 1, ...(nextBase ? { phaseBase: nextBase } : {}), ...(seenDirs ? { workDirs: seenDirs } : {}) };
               await saveState(advanced);
               const last = index + 1 >= phases.length;
               return {
@@ -2282,7 +2377,7 @@ export default {
             }
 
             const switched = await switchRole({ sessionID, state, targetRole: "lead", reason: "checkpoint" });
-            const waiting: FusionState = { ...switched, activePlan: notedPlan, awaitingCheckpoint: index, phaseBounces: 0 };
+            const waiting: FusionState = { ...switched, activePlan: notedPlan, awaitingCheckpoint: index, phaseBounces: 0, ...(evidence.touched.length ? { workDirs: [...(state.workDirs ?? []), ...evidence.touched].slice(-MAX_TREES) } : {}) };
             await saveState(waiting);
             const targetModel = waiting.roleModels.lead ?? (await resolveConfiguredRoleModels()).lead;
             return {
@@ -2355,7 +2450,7 @@ export default {
             const phaseIndex = decision === "continue" ? index + 1 : index;
 
             const switched = await switchRole({ sessionID, state, targetRole: "fellow", activePlan: amended, incrementHandoffs: true });
-            const resumeBase = decision === "continue" ? snapshotWork(await sessionRoot(sessionID), state.roundDirs) : undefined;
+            const resumeBase = decision === "continue" ? snapshotWork(await sessionRoot(sessionID), state.workDirs) : undefined;
             const next: FusionState = { ...switched, phaseIndex, phaseBounces: 0, ...(resumeBase ? { phaseBase: resumeBase } : {}) };
             delete next.awaitingCheckpoint;
             await saveState(next);
@@ -2453,7 +2548,7 @@ export default {
             const root: string = ses?.location?.directory ?? ses?.directory ?? process.cwd();
             let results: CheckResult[] = [];
             if (gateEnabled && checks.length > 0 && reason === "completed") {
-              results = await runChecks(root, checks, checkTimeoutMs);
+              results = await runChecks(root, checks, checkTimeoutMs, state.workDirs);
               const failed = results.filter((result) => result.status === "failed");
               if (failed.length > 0 && state.verifyBounces < verifyRetries) {
                 // Straight back to Fellow. Lead is not woken, and the handoff budget is untouched.
@@ -2470,7 +2565,7 @@ export default {
               }
             }
 
-            const workHash = workFingerprint(root, state.roundDirs);
+            const workHash = workFingerprint(root, state.workDirs);
             const unclean = reason !== "completed" || results.some((result) => result.status !== "passed");
             // A round counts as stalled when planned work came back unfinished with the workspace exactly as it was
             // when the round began. A small job (a lookup, a command to run) changes nothing by nature and is not counted.
@@ -2483,7 +2578,8 @@ export default {
               targetRole: "lead",
               reason,
             });
-            const next: FusionState = { ...switched, stalledReturns };
+            const evidence = changeEvidence(root, state.roundBase, state.workDirs);
+            const next: FusionState = { ...switched, stalledReturns, ...(evidence.touched.length ? { workDirs: [...(state.workDirs ?? []), ...evidence.touched].slice(-MAX_TREES) } : {}) };
             delete next.awaitingCheckpoint;
             await saveState(next);
 
@@ -2508,7 +2604,7 @@ export default {
                     : checks.length === 0 && plan
                       ? ["No `checks` were given in the plan, so nothing was verified by Fusion. Fellow's report above is unverified."]
                       : []),
-                ...changeEvidence(root, state.roundBase, state.roundDirs).lines,
+                ...evidence.lines,
                 unreported.length && reason === "completed"
                   ? `Phases that were never reported at a checkpoint (their checks were only run now, at the end): ${unreported.join(" | ")}`
                   : "",
@@ -2627,7 +2723,7 @@ export default {
             if (state.role !== "lead") throw new Error("shell is only available in Lead mode.");
             if (!isReadOnlyShell(command)) {
               throw new Error(
-                `Lead runs read-only commands only (git log / status / diff / show / blame, ls, cat, head, tail, wc, grep, rg, and pipes between them). This one is not: ${command.replace(/\s+/g, " ").trim().slice(0, 120)}. Hand it to Fellow with handoff_to_fellow; for a small job give only \`summary\` (what to run or change, and what to report back).`,
+                `Lead runs read-only commands only (git log / status / diff / show / blame, ls, cat, head, tail, wc, grep, rg, find, sed -n N,Mp, and pipes between them; no loops or redirections). This one is not: ${command.replace(/\s+/g, " ").trim().slice(0, 120)}. Hand it to Fellow with handoff_to_fellow; for a small job give only \`summary\` (what to run or change, and what to report back).`,
               );
             }
             if (event?.id) inFlightCallEpoch.set(callKey(sessionID, String(event.id)), state.epoch);
@@ -2706,17 +2802,23 @@ export default {
             }
           }
 
+          if (event.tool === "edit" || event.tool === "write" || event.tool === "patch") {
+            // An edit outside the session's own folder says where the work is, as a command there does.
+            const input = event.input && typeof event.input === "object" ? (event.input as Record<string, unknown>) : {};
+            const named = [input.filePath, input.path, input.file].filter((value): value is string => typeof value === "string");
+            for (const text of [input.patchText, input.patch, input.input].filter((value): value is string => typeof value === "string")) {
+              for (const match of text.matchAll(/^\*\*\* (?:Update|Add|Delete) File: (.+)$/gm)) named.push(match[1].trim());
+            }
+            const root = await sessionRoot(sessionID);
+            await noteWorkFolders(state, root, named.filter((file) => nodePath.isAbsolute(file)).map((file) => nodePath.dirname(file)));
+          }
           if (event.tool === "shell") {
             // The risk gate. Whatever the plan said, this is the moment the command would take effect.
             const command = rawShellCommand(event.input);
             const root = await sessionRoot(sessionID);
             const given = event.input && typeof event.input === "object" ? (event.input as Record<string, unknown>).workdir ?? (event.input as Record<string, unknown>).cwd : undefined;
             const runsIn = typeof given === "string" && given.trim() ? nodePath.resolve(root, given.trim()) : root;
-            if (!samePath(runsIn, root) && !(state.roundDirs ?? []).some((dir) => samePath(dir, runsIn)) && !workTrees(root).some((tree) => runsIn.replace(/\\/g, "/").toLowerCase().startsWith(tree.toLowerCase()))) {
-              // Work in another repository: remembered, so its changes are part of what Lead is shown.
-              state.roundDirs = [...(state.roundDirs ?? []), runsIn].slice(-MAX_TREES);
-              await saveState({ ...state, revision: state.revision + 1 }, { emit: false });
-            }
+            await noteWorkFolders(state, root, [runsIn, ...commandFolders(command, runsIn)]);
             const risk = findRisk(command, runsIn);
             if (risk) {
               if (state.approvedRisk === risk.key) {

@@ -1025,7 +1025,7 @@ test("9. gate edge cases: a command that cannot run, a blocked return, a plan wi
   const unrunnable = await toPlan.execute({ reason: "completed", summary: "done" }, { sessionID: "ses_1", agent: "fellow" });
   assert.match(unrunnable.content, /LEAD MODE ACTIVE/);
   assert.match(unrunnable.content, /COULD NOT RUN.*definitely-not-a-real-command-xyz/);
-  assert.match(unrunnable.content, /cwd must be a folder inside the project/);
+  assert.match(unrunnable.content, /cwd must be a folder inside the project or one of its worktrees/);
   assert.match(unrunnable.content, /Do not report this as done/);
 
   // Fellow says it is blocked: the checks are not run, and Lead is told so.
@@ -1454,6 +1454,10 @@ test("17. Lead reads and Fellow acts: read-only shell for Lead, a small job hand
   // Looking is open to Lead without anything being declared.
   for (const command of [
     "git branch --contains HEAD",
+    "sed -n 40,60p package.json",
+    "sed -n '1,$p' src/a.ts | head -5",
+    "find src -name '*.test.tsx' -type f | head -20",
+    "fd config src",
     "git branch -vv",
     "git tag -l 'v*'",
     "git tag -n3",
@@ -1483,6 +1487,12 @@ test("17. Lead reads and Fellow acts: read-only shell for Lead, a small job hand
 
   // Anything with effects is refused, with the way on.
   for (const command of [
+    // sed and find only to look.
+    "sed -n 'w out.txt' in.txt",
+    "sed -n 1,5d file",
+    "sed s/a/b/ file",
+    "find . -name '*.log' -exec rm {} +",
+    "fd -x rm",
     // A name after `branch` or `tag` makes one unless a flag puts the command in list mode.
     "git branch -v topic",
     "git branch --sort=-committerdate topic",
@@ -1594,6 +1604,7 @@ test("18. the scout: lookups run in a child session through the host's subagent 
   // Lead is told where lookups go, and may start the scout and nothing else.
   const lead = mock.agents.get("lead");
   assert.match(lead.system, /call the `subagent` tool with agent `scout`/);
+  assert.match(lead.system, /Say what you did not see\./);
   assert.equal(resolvePermissionEffect(lead.permissions, "subagent"), "allow");
   const started = await call("subagent", { agent: "scout", description: "Read the thread", prompt: "Read the chat thread at X and report who decided what." });
   // It runs on the Fellow's model, and is told where raw material goes.
@@ -1855,6 +1866,15 @@ test("21. work in another worktree: the changes, the progress and the risk are j
   assert.match(first.content, /commit [0-9a-f]{7,} add the feature/);
   assert.match(first.content, /\+feature line/);
   assert.equal(stalled(), 0);
+
+  // The plan's checks can run in that worktree, named by its absolute path; a folder that is no part of the work cannot be named.
+  await toFellow.execute(
+    { ...plan, checks: [{ command: `node -e "process.exit(require('fs').existsSync('feature.txt')?0:1)"`, cwd: wt }, { command: 'node -e "process.exit(0)"', cwd: os.tmpdir() }] },
+    asLead,
+  );
+  const checked = await toLead.execute({ reason: "completed", summary: "checked in the worktree" }, asFellow);
+  assert.match(checked.content, /Checks run by Fusion: 1\/2 passed/);
+  assert.match(checked.content, /COULD NOT RUN[\s\S]*cwd must be a folder inside the project or one of its worktrees/);
 
   // Round 2: the worktree is there from the start. Uncommitted work in it is progress, and only this round's change is shown.
   await toFellow.execute(plan, asLead);
