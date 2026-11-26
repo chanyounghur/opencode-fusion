@@ -73,10 +73,16 @@ interface CheckResult {
   tail: string;
 }
 
-/** The workspace at one moment: a commit that holds it (HEAD, or HEAD with the uncommitted changes on top) and the files git did not know then. */
-interface WorkBase {
+/** One working tree at one moment: a commit that holds it (HEAD, or HEAD with the uncommitted changes on top) and the files git did not know then. */
+interface TreeBase {
+  path: string;
   ref: string;
   untracked: string[];
+}
+
+/** Everywhere the work can be, at one moment: the worktrees of the session's repository and any other repository Fellow ran commands in. */
+interface WorkBase {
+  trees: TreeBase[];
 }
 
 interface PlanPhase {
@@ -136,6 +142,8 @@ interface FusionState {
   // The workspace when the current round began, and when the current phase began: what Lead is shown is measured from these.
   roundBase?: WorkBase;
   phaseBase?: WorkBase;
+  // Folders outside the session's own repository in which Fellow ran commands during this round.
+  roundDirs?: string[];
   // Which phase Fellow is on (0-based), and how often its checkpoint was sent back by failing checks.
   phaseIndex: number;
   phaseBounces: number;
@@ -1137,80 +1145,169 @@ const EVIDENCE_PREVIEW_CHARS = 3000;
 const EVIDENCE_STAT_LINES = 24;
 const IGNORED_ROW = /node_modules\/|opencode\.json$/;
 
+const GIT_REF = /^[0-9a-f]{7,64}$/;
+const MAX_TREES = 12;
+
 function normalizeWorkBase(raw: unknown): WorkBase | undefined {
   if (!raw || typeof raw !== "object") return undefined;
   const obj = raw as Record<string, unknown>;
-  if (typeof obj.ref !== "string" || !/^[0-9a-f]{7,64}$/.test(obj.ref)) return undefined;
-  return { ref: obj.ref, untracked: sanitizeStringList(obj.untracked).slice(0, 400) };
+  // The first form of this record held one tree, the session's own folder (path "").
+  const list: unknown[] = Array.isArray(obj.trees) ? obj.trees : typeof obj.ref === "string" ? [{ path: "", ref: obj.ref, untracked: obj.untracked }] : [];
+  const trees: TreeBase[] = [];
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const tree = item as Record<string, unknown>;
+    if (typeof tree.ref !== "string" || !GIT_REF.test(tree.ref)) continue;
+    trees.push({ path: typeof tree.path === "string" ? tree.path : "", ref: tree.ref, untracked: sanitizeStringList(tree.untracked).slice(0, 400) });
+    if (trees.length >= MAX_TREES) break;
+  }
+  return trees.length ? { trees } : undefined;
 }
 
-/** Records the workspace as it is, without touching it: `git stash create` writes the uncommitted state as a commit and changes nothing. */
-function snapshotWork(root: string): WorkBase | undefined {
-  const git = (args: string[]) => spawnSync("git", ["-C", root, "-c", "core.quotepath=false", ...args], { encoding: "utf8", windowsHide: true, timeout: 20_000, maxBuffer: 16 * 1024 * 1024 });
-  const out = (args: string[]) => {
-    const res = git(args);
-    return res.status === 0 && typeof res.stdout === "string" ? res.stdout.trim() : "";
-  };
-  const ref = out(["stash", "create"]) || out(["rev-parse", "HEAD"]);
-  if (!/^[0-9a-f]{7,64}$/.test(ref)) return undefined;
-  const untracked = out(["ls-files", "--others", "--exclude-standard"]).split("\n").filter((file) => file && !IGNORED_ROW.test(file)).slice(0, 400);
-  return { ref, untracked };
+function gitIn(dir: string, args: string[], maxBuffer = 16 * 1024 * 1024) {
+  return spawnSync("git", ["-C", dir, "-c", "core.quotepath=false", ...args], { encoding: "utf8", windowsHide: true, timeout: 20_000, maxBuffer });
+}
+
+function gitText(dir: string, args: string[], maxBuffer?: number): string {
+  const res = gitIn(dir, args, maxBuffer);
+  return res.status === 0 && typeof res.stdout === "string" ? res.stdout.replace(/\s+$/, "") : "";
+}
+
+function samePath(a: string, b: string): boolean {
+  const norm = (value: string) => nodePath.resolve(value).replace(/\\/g, "/").replace(/\/+$/, "");
+  return process.platform === "win32" ? norm(a).toLowerCase() === norm(b).toLowerCase() : norm(a) === norm(b);
 }
 
 /**
- * What changed since `base`: commits made, a diffstat, the files that are new, and the first part of the diff itself.
- * This is what Lead reviews from, so it is measured from the start of the work under review and does not repeat
- * whatever was already lying in the workspace before.
+ * Every folder the work of a session can be in: the session's own repository, its other worktrees (work is often done
+ * in one made for the task, next to the folder the session was opened in), and any other repository named in `extra`.
+ * The session's own tree comes first.
  */
-function changeEvidence(root: string, base: WorkBase | undefined): { lines: string[]; files: string[] } {
+function workTrees(root: string, extra: string[] = []): string[] {
+  const out: string[] = [];
+  const add = (dir: string) => {
+    const full = nodePath.resolve(dir).replace(/\\/g, "/");
+    if (full && !out.some((known) => samePath(known, full)) && out.length < MAX_TREES) out.push(full);
+  };
+  add(gitText(root, ["rev-parse", "--show-toplevel"]) || root);
+  for (const line of gitText(root, ["worktree", "list", "--porcelain"]).split("\n")) {
+    if (line.startsWith("worktree ")) add(line.slice("worktree ".length).trim());
+  }
+  for (const dir of extra) {
+    const top = gitText(dir, ["rev-parse", "--show-toplevel"]);
+    if (top) add(top);
+  }
+  return out;
+}
+
+function untrackedIn(tree: string): string[] {
+  return gitText(tree, ["ls-files", "--others", "--exclude-standard"]).split("\n").filter((file) => file && !IGNORED_ROW.test(file));
+}
+
+/** Records the work as it is, without touching it: `git stash create` writes a tree's uncommitted state as a commit and changes nothing. */
+function snapshotWork(root: string, extra: string[] = []): WorkBase | undefined {
+  const trees: TreeBase[] = [];
+  for (const tree of workTrees(root, extra)) {
+    const ref = gitText(tree, ["stash", "create"]) || gitText(tree, ["rev-parse", "HEAD"]);
+    if (!GIT_REF.test(ref)) continue;
+    trees.push({ path: tree, ref, untracked: untrackedIn(tree).slice(0, 400) });
+  }
+  return trees.length ? { trees } : undefined;
+}
+
+/** One value for the state of all the work: it changes when any tree gets a commit, an edit, or a new file. */
+function workFingerprint(root: string, extra: string[] = []): string | undefined {
+  const hash = createHash("sha1");
+  let seen = 0;
+  for (const tree of workTrees(root, extra)) {
+    const status = gitIn(tree, ["status", "--porcelain", "--untracked-files=all"]);
+    if (status.status !== 0 || typeof status.stdout !== "string") continue;
+    seen += 1;
+    hash
+      .update(tree)
+      .update(gitText(tree, ["rev-parse", "HEAD"]))
+      .update(status.stdout.split("\n").filter((line) => line.trim() && !IGNORED_ROW.test(line)).join("\n"))
+      .update(gitText(tree, ["diff", "HEAD"], 64 * 1024 * 1024));
+  }
+  return seen > 0 ? hash.digest("hex") : undefined;
+}
+
+/**
+ * What changed since `base`, in every tree: commits made, a diffstat, the files that are new, and the first part of the
+ * diff itself. This is what Lead reviews from, so it is measured from the start of the work under review and does not
+ * repeat whatever was already lying there before. A worktree made during the work is measured from the commit it was
+ * made at.
+ */
+function changeEvidence(root: string, base: WorkBase | undefined, extra: string[] = []): { lines: string[]; files: string[] } {
   if (!base) {
     const digest = workspaceDigest(root);
     return { lines: digest.summary, files: digest.files };
   }
-  const git = (args: string[]) => spawnSync("git", ["-C", root, "-c", "core.quotepath=false", ...args], { encoding: "utf8", windowsHide: true, timeout: 20_000, maxBuffer: 64 * 1024 * 1024 });
-  const out = (args: string[]) => {
-    const res = git(args);
-    return res.status === 0 && typeof res.stdout === "string" ? res.stdout.replace(/\s+$/, "") : "";
-  };
-  const commits = out(["log", "--oneline", "-n", "12", `${base.ref}..HEAD`]).split("\n").filter(Boolean);
-  const changed = out(["diff", "--name-only", base.ref]).split("\n").filter((file) => file && !IGNORED_ROW.test(file));
-  const known = new Set(base.untracked);
-  const fresh = out(["ls-files", "--others", "--exclude-standard"]).split("\n").filter((file) => file && !IGNORED_ROW.test(file) && !known.has(file));
-  const files = [...changed, ...fresh];
-  if (files.length === 0 && commits.length === 0) return { lines: ["Changes since this work began: none."], files };
-  const stat = out(["diff", "--stat=110", base.ref]).split("\n").filter(Boolean);
-  const diff = out(["diff", "-U1", "--no-color", base.ref]);
-  const lines = [
-    `Changes since this work began (${files.length} file(s)${commits.length ? `, ${commits.length}${commits.length === 12 ? "+" : ""} commit(s)` : ""}):`,
-    ...commits.map((row) => `  commit ${row}`),
-    ...stat.slice(0, EVIDENCE_STAT_LINES).map((row) => `  ${row.trim()}`),
-    ...(stat.length > EVIDENCE_STAT_LINES ? [`  … ${stat.length - EVIDENCE_STAT_LINES} more lines of the summary`] : []),
-    ...(fresh.length ? [`  new files: ${fresh.slice(0, 12).join(", ")}${fresh.length > 12 ? `, … ${fresh.length - 12} more` : ""}`] : []),
-  ];
-  if (diff) {
-    lines.push(
-      diff.length > EVIDENCE_PREVIEW_CHARS
-        ? `The diff, first ${EVIDENCE_PREVIEW_CHARS} of ${diff.length} characters (the rest: \`git diff ${base.ref.slice(0, 10)}\`):`
-        : "The diff:",
-      diff.slice(0, EVIDENCE_PREVIEW_CHARS),
+  const now = workTrees(root, extra);
+  const own = now[0] ?? root;
+  const before = base.trees.map((tree) => ({ ...tree, path: tree.path || own }));
+  const body: string[] = [];
+  const files: string[] = [];
+  let commitCount = 0;
+  let room = EVIDENCE_PREVIEW_CHARS;
+  for (const tree of now) {
+    const was = before.find((entry) => samePath(entry.path, tree));
+    // A tree that was not there when the work began is measured from where it was made: the oldest entry of its own HEAD log.
+    const baseRef = was?.ref ?? gitText(tree, ["reflog", "show", "--format=%H", "HEAD"]).split("\n").filter(Boolean).at(-1) ?? "";
+    if (!GIT_REF.test(baseRef)) continue;
+    const commits = gitText(tree, ["log", "--oneline", "-n", "12", `${baseRef}..HEAD`]).split("\n").filter(Boolean);
+    const changed = gitText(tree, ["diff", "--name-only", baseRef]).split("\n").filter((file) => file && !IGNORED_ROW.test(file));
+    const known = new Set(was?.untracked ?? []);
+    const fresh = untrackedIn(tree).filter((file) => !known.has(file));
+    if (commits.length === 0 && changed.length === 0 && fresh.length === 0) {
+      if (!was) body.push(`In ${tree}, a worktree made during this work: nothing changed yet.`);
+      continue;
+    }
+    files.push(...changed, ...fresh);
+    commitCount += commits.length;
+    if (!samePath(tree, own) || !was) {
+      const branch = gitText(tree, ["branch", "--show-current"]);
+      body.push(`In ${tree}${branch ? ` (branch ${branch})` : ""}${was ? "" : ", a worktree made during this work"}:`);
+    }
+    const stat = gitText(tree, ["diff", "--stat=110", baseRef]).split("\n").filter(Boolean);
+    body.push(
+      ...commits.map((row) => `  commit ${row}`),
+      ...stat.slice(0, EVIDENCE_STAT_LINES).map((row) => `  ${row.trim()}`),
+      ...(stat.length > EVIDENCE_STAT_LINES ? [`  … ${stat.length - EVIDENCE_STAT_LINES} more lines of the summary`] : []),
+      ...(fresh.length ? [`  new files: ${fresh.slice(0, 12).join(", ")}${fresh.length > 12 ? `, … ${fresh.length - 12} more` : ""}`] : []),
     );
-  }
-  // New files are not in the diff (git does not know them yet): show the start of each while there is room.
-  let room = EVIDENCE_PREVIEW_CHARS - Math.min(diff.length, EVIDENCE_PREVIEW_CHARS);
-  for (const file of fresh) {
-    if (room < 200) break;
-    try {
-      const body = readFileSync(nodePath.join(root, file));
-      if (body.length > 400_000 || body.includes(0)) continue;
-      const text = body.toString("utf8");
-      const shown = text.slice(0, Math.min(room, 1200));
-      lines.push(`New file ${file}${shown.length < text.length ? ` (first ${shown.length} of ${text.length} characters)` : ""}:`, shown.replace(/\s+$/, ""));
+    const diff = room > 200 ? gitText(tree, ["diff", "-U1", "--no-color", baseRef], 64 * 1024 * 1024) : "";
+    if (diff) {
+      const shown = diff.slice(0, room);
+      body.push(
+        shown.length < diff.length
+          ? `The diff, first ${shown.length} of ${diff.length} characters (the rest: \`git -C ${tree} diff ${baseRef.slice(0, 10)}\`):`
+          : "The diff:",
+        shown,
+      );
       room -= shown.length;
-    } catch {
-      // a folder, or gone again
+    }
+    // New files are not in the diff (git does not know them yet): show the start of each while there is room.
+    for (const file of fresh) {
+      if (room < 200) break;
+      try {
+        const content = readFileSync(nodePath.join(tree, file));
+        if (content.length > 400_000 || content.includes(0)) continue;
+        const text = content.toString("utf8");
+        const shown = text.slice(0, Math.min(room, 1200));
+        body.push(`New file ${file}${shown.length < text.length ? ` (first ${shown.length} of ${text.length} characters)` : ""}:`, shown.replace(/\s+$/, ""));
+        room -= shown.length;
+      } catch {
+        // a folder, or gone again
+      }
     }
   }
-  return { lines, files };
+  for (const entry of before) {
+    if (!now.some((tree) => samePath(tree, entry.path))) body.push(`A worktree that was there when this work began is gone: ${entry.path}`);
+  }
+  if (body.length === 0) return { lines: ["Changes since this work began: none."], files };
+  if (files.length === 0 && commitCount === 0) return { lines: ["Changes since this work began: none in any file.", ...body], files };
+  return { lines: [`Changes since this work began (${files.length} file(s)${commitCount ? `, ${commitCount} commit(s)` : ""}):`, ...body], files };
 }
 
 /** What the workspace looks like now: a short change summary for Lead and a fingerprint to notice rounds that changed nothing. */
@@ -1701,6 +1798,7 @@ export default {
         ...(typeof data.approvedRisk === "string" ? { approvedRisk: data.approvedRisk } : {}),
         ...(normalizeWorkBase(data.roundBase) ? { roundBase: normalizeWorkBase(data.roundBase) } : {}),
         ...(normalizeWorkBase(data.phaseBase) ? { phaseBase: normalizeWorkBase(data.phaseBase) } : {}),
+        ...(sanitizeStringList(data.roundDirs).length ? { roundDirs: sanitizeStringList(data.roundDirs).slice(0, 12) } : {}),
         phaseIndex: typeof data.phaseIndex === "number" && data.phaseIndex >= 0 ? data.phaseIndex : 0,
         phaseBounces: typeof data.phaseBounces === "number" && data.phaseBounces >= 0 ? data.phaseBounces : 0,
         ...(typeof data.awaitingCheckpoint === "number" ? { awaitingCheckpoint: data.awaitingCheckpoint } : {}),
@@ -1874,7 +1972,7 @@ export default {
         const ses = await ctx.session.get({ sessionID }).catch(() => undefined);
         const root: string = ses?.location?.directory ?? ses?.directory ?? process.cwd();
         const checks = allPlanChecks(state.activePlan);
-        const lines = [...changeEvidence(root, state.roundBase).lines];
+        const lines = [...changeEvidence(root, state.roundBase, state.roundDirs).lines];
         if (checks.length === 0) return lines;
         if (!gateEnabled || !options.runPlanChecks) {
           lines.push(`The plan's ${checks.length} check(s) were NOT run by Fusion on this return. Nothing here is verified.`);
@@ -2040,7 +2138,7 @@ export default {
               incrementHandoffs: true,
             });
             const startRoot = await sessionRoot(sessionID);
-            const startHash = workspaceDigest(startRoot).hash;
+            const startHash = workFingerprint(startRoot);
             const startBase = snapshotWork(startRoot);
             const next: FusionState = { ...switched, phaseIndex: 0, phaseBounces: 0, ...(startHash ? { lastWorkHash: startHash } : {}), ...(startBase ? { roundBase: startBase, phaseBase: startBase } : {}) };
             if (!startHash) delete next.lastWorkHash;
@@ -2048,6 +2146,7 @@ export default {
               delete next.roundBase;
               delete next.phaseBase;
             }
+            delete next.roundDirs;
             delete next.awaitingCheckpoint;
             await saveState(next);
 
@@ -2149,7 +2248,7 @@ export default {
               };
             }
 
-            const evidence = changeEvidence(root, state.phaseBase ?? state.roundBase);
+            const evidence = changeEvidence(root, state.phaseBase ?? state.roundBase, state.roundDirs);
             const strays = offPlanFiles(evidence.files, plan.files);
             const notPassed = results.filter((result) => result.status !== "passed");
             const reasons = [
@@ -2167,7 +2266,7 @@ export default {
 
             if (reasons.length === 0) {
               // Nothing calls for Lead: go straight on. This is the common case and costs no Lead call.
-              const nextBase = snapshotWork(root);
+              const nextBase = snapshotWork(root, state.roundDirs);
               const advanced: FusionState = { ...state, activePlan: notedPlan, phaseIndex: index + 1, phaseBounces: 0, revision: state.revision + 1, ...(nextBase ? { phaseBase: nextBase } : {}) };
               await saveState(advanced);
               const last = index + 1 >= phases.length;
@@ -2256,7 +2355,7 @@ export default {
             const phaseIndex = decision === "continue" ? index + 1 : index;
 
             const switched = await switchRole({ sessionID, state, targetRole: "fellow", activePlan: amended, incrementHandoffs: true });
-            const resumeBase = decision === "continue" ? snapshotWork(await sessionRoot(sessionID)) : undefined;
+            const resumeBase = decision === "continue" ? snapshotWork(await sessionRoot(sessionID), state.roundDirs) : undefined;
             const next: FusionState = { ...switched, phaseIndex, phaseBounces: 0, ...(resumeBase ? { phaseBase: resumeBase } : {}) };
             delete next.awaitingCheckpoint;
             await saveState(next);
@@ -2371,12 +2470,12 @@ export default {
               }
             }
 
-            const digest = workspaceDigest(root);
+            const workHash = workFingerprint(root, state.roundDirs);
             const unclean = reason !== "completed" || results.some((result) => result.status !== "passed");
             // A round counts as stalled when planned work came back unfinished with the workspace exactly as it was
             // when the round began. A small job (a lookup, a command to run) changes nothing by nature and is not counted.
             const smallJob = Boolean(plan && plan.phases.length === 0 && plan.files.length === 0 && plan.steps.length === 1 && plan.steps[0] === plan.summary);
-            const stalledReturns = unclean && !smallJob && digest.hash !== undefined && digest.hash === state.lastWorkHash ? state.stalledReturns + 1 : 0;
+            const stalledReturns = unclean && !smallJob && workHash !== undefined && workHash === state.lastWorkHash ? state.stalledReturns + 1 : 0;
 
             const switched = await switchRole({
               sessionID,
@@ -2409,7 +2508,7 @@ export default {
                     : checks.length === 0 && plan
                       ? ["No `checks` were given in the plan, so nothing was verified by Fusion. Fellow's report above is unverified."]
                       : []),
-                ...changeEvidence(root, state.roundBase).lines,
+                ...changeEvidence(root, state.roundBase, state.roundDirs).lines,
                 unreported.length && reason === "completed"
                   ? `Phases that were never reported at a checkpoint (their checks were only run now, at the end): ${unreported.join(" | ")}`
                   : "",
@@ -2610,7 +2709,15 @@ export default {
           if (event.tool === "shell") {
             // The risk gate. Whatever the plan said, this is the moment the command would take effect.
             const command = rawShellCommand(event.input);
-            const risk = findRisk(command, await sessionRoot(sessionID));
+            const root = await sessionRoot(sessionID);
+            const given = event.input && typeof event.input === "object" ? (event.input as Record<string, unknown>).workdir ?? (event.input as Record<string, unknown>).cwd : undefined;
+            const runsIn = typeof given === "string" && given.trim() ? nodePath.resolve(root, given.trim()) : root;
+            if (!samePath(runsIn, root) && !(state.roundDirs ?? []).some((dir) => samePath(dir, runsIn)) && !workTrees(root).some((tree) => runsIn.replace(/\\/g, "/").toLowerCase().startsWith(tree.toLowerCase()))) {
+              // Work in another repository: remembered, so its changes are part of what Lead is shown.
+              state.roundDirs = [...(state.roundDirs ?? []), runsIn].slice(-MAX_TREES);
+              await saveState({ ...state, revision: state.revision + 1 }, { emit: false });
+            }
+            const risk = findRisk(command, runsIn);
             if (risk) {
               if (state.approvedRisk === risk.key) {
                 const used: FusionState = { ...state, revision: state.revision + 1 };

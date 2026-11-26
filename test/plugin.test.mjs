@@ -1810,7 +1810,7 @@ test("20. evidence with the report: Lead is shown what changed since the work be
   const second = await checkpoint.execute({ done: "wrote two.txt" }, asFellow);
   assert.match(second.content, /two\.txt/);
   assert.doesNotMatch(second.content, /one\.txt/);                       // the first phase's change is not shown again
-  assert.match(second.content, /The diff, first 3000 of \d+ characters \(the rest: `git diff [0-9a-f]{10}`\):/);
+  assert.match(second.content, /The diff, first 3000 of \d+ characters \(the rest: `git -C \S+ diff [0-9a-f]{10}`\):/);
   assert.ok(second.content.length < 6000, `the checkpoint report stays small (${second.content.length} characters)`);
   await resume.execute({ decision: "continue" }, asLead);
   // The whole round is shown at the end, both phases together. A blocked return is never held up by an unseen phase.
@@ -1820,4 +1820,78 @@ test("20. evidence with the report: Lead is shown what changed since the work be
 
   await cleanup?.();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("21. work in another worktree: the changes, the progress and the risk are judged where the work happens", async () => {
+  const dir = tempProject();
+  const wt = `${dir}-wt`;
+  const other = tempProject();
+  const git = (where, ...args) => execFileSync("git", ["-C", where, ...args], { stdio: "ignore" });
+  const mock = createMockOpenCode({ maxHandoffsPerTurn: 20 });
+  const cleanup = await plugin.setup(mock.ctx);
+  mock.sessions.get("ses_1").location = { directory: dir };
+  const before = mock.toolBeforeHooks[0];
+  const toFellow = mock.tools.get("handoff_to_fellow");
+  const toLead = mock.tools.get("handoff_to_lead");
+  const asLead = { sessionID: "ses_1", agent: "lead" };
+  const asFellow = { sessionID: "ses_1", agent: "fellow" };
+  const stalled = () => mock.storage.get("fusion:ses_1").stalledReturns;
+  const plan = { summary: "Build the feature on its own branch", files: ["a.txt", "feature.txt"], steps: ["make a worktree", "implement", "commit"] };
+  const wtName = path.basename(wt).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  let n = 0;
+  const shell = (command, workdir) => before({ tool: "shell", agent: "fellow", sessionID: "ses_1", id: `w_${(n += 1)}`, messageID: `wm_${n}`, input: workdir ? { command, workdir } : { command } });
+
+  // Round 1: Fellow makes a worktree next to the session's folder and does all its work there. The session's own
+  // folder never changes.
+  await toFellow.execute(plan, asLead);
+  git(dir, "worktree", "add", "--quiet", "-b", "feat/x", wt, "HEAD");
+  fs.writeFileSync(path.join(wt, "a.txt"), "one\nfeature line\n");
+  fs.writeFileSync(path.join(wt, "feature.txt"), "new\n");
+  git(wt, "add", "-A");
+  git(wt, "commit", "--quiet", "-m", "add the feature");
+  const first = await toLead.execute({ reason: "completed", summary: "done in the worktree" }, asFellow);
+  assert.match(first.content, /Changes since this work began \(2 file\(s\), 1 commit\(s\)\):/);
+  assert.match(first.content, new RegExp(`In \\S*${wtName} \\(branch feat/x\\), a worktree made during this work:`));
+  assert.match(first.content, /commit [0-9a-f]{7,} add the feature/);
+  assert.match(first.content, /\+feature line/);
+  assert.equal(stalled(), 0);
+
+  // Round 2: the worktree is there from the start. Uncommitted work in it is progress, and only this round's change is shown.
+  await toFellow.execute(plan, asLead);
+  fs.writeFileSync(path.join(wt, "feature.txt"), "new\nsecond round\n");
+  const second = await toLead.execute({ reason: "blocked", summary: "half way" }, asFellow);
+  assert.equal(stalled(), 0);
+  assert.match(second.content, new RegExp(`In \\S*${wtName} \\(branch feat/x\\):`));
+  assert.match(second.content, /\+second round/);
+  assert.doesNotMatch(second.content, /add the feature/);          // last round's commit is not shown again
+  assert.doesNotMatch(second.content, /a worktree made during this work/);
+
+  // Round 3: nothing changes anywhere. That, and only that, is a round without progress.
+  await toFellow.execute(plan, asLead);
+  const third = await toLead.execute({ reason: "blocked", summary: "stuck" }, asFellow);
+  assert.match(third.content, /Changes since this work began: none\./);
+  assert.equal(stalled(), 1);
+
+  // The risk gate judges in the folder the command runs in: the worktree has uncommitted work, the session's folder has none.
+  await toFellow.execute(plan, asLead);
+  await shell("git reset --hard");                                   // in the session's own folder: nothing to lose
+  await assert.rejects(() => shell("git reset --hard", wt), /uncommitted changes that would be gone: feature\.txt/);
+  await assert.rejects(() => shell(`git -C ${wt.replaceAll("\\", "/")} reset --hard`), /uncommitted changes that would be gone/);
+
+  // Work in a different repository altogether: seen once Fellow runs a command there.
+  await shell("git status", other);
+  fs.writeFileSync(path.join(other, "elsewhere.txt"), "x\n");
+  const fourth = await toLead.execute({ reason: "completed", summary: "also touched the other repository" }, asFellow);
+  assert.match(fourth.content, new RegExp(`In \\S*${path.basename(other)}`));
+  assert.match(fourth.content, /new files: elsewhere\.txt/);
+  assert.doesNotMatch(fourth.content, /second round/);                // what the worktree already held when this round began is not this round's
+
+  // A worktree removed during the work is said so.
+  await toFellow.execute(plan, asLead);
+  git(dir, "worktree", "remove", "--force", wt);
+  const fifth = await toLead.execute({ reason: "completed", summary: "cleaned up" }, asFellow);
+  assert.match(fifth.content, new RegExp(`A worktree that was there when this work began is gone: \\S*${wtName}`));
+
+  await cleanup?.();
+  for (const folder of [dir, wt, other]) fs.rmSync(folder, { recursive: true, force: true });
 });
