@@ -37,6 +37,8 @@ function createMockOpenCode(givenOptions = {}, mockOpts = {}) {
   const sessionContextHooks = [];
   const switchCalls = [];
   const syntheticCalls = [];
+  const moveCalls = [];
+  const hostCreates = [];
   const rpcRegistrations = new Map();
   const rpcEmittedEvents = [];
 
@@ -143,9 +145,28 @@ function createMockOpenCode(givenOptions = {}, mockOpts = {}) {
         };
       },
     },
+    // The host's own worktree service, only when a test asks for it: without it the plugin makes worktrees with git.
+    ...(mockOpts.hostWorktree
+      ? {
+          worktree: {
+            async create(input) {
+              hostCreates.push(input);
+              const directory = path.join(input.directory, input.name);
+              execFileSync("git", ["-C", mockOpts.hostWorktree, "worktree", "add", "--detach", "--quiet", directory, input.branch ?? "HEAD"], { stdio: "ignore" });
+              return { directory };
+            },
+            async refresh() {},
+          },
+        }
+      : {}),
     session: {
       async get({ sessionID }) {
         return sessions.get(sessionID);
+      },
+      async move({ sessionID, directory, delivery }) {
+        const ses = sessions.get(sessionID);
+        if (ses) ses.location = { directory };
+        moveCalls.push({ sessionID, directory, delivery });
       },
       async switchAgent({ sessionID, agent }) {
         const ses = sessions.get(sessionID);
@@ -290,6 +311,8 @@ function createMockOpenCode(givenOptions = {}, mockOpts = {}) {
     sessionContextHooks,
     switchCalls,
     syntheticCalls,
+    moveCalls,
+    hostCreates,
     rpcRegistrations,
     rpcEmittedEvents,
     emitEvent,
@@ -1454,6 +1477,13 @@ test("17. Lead reads and Fellow acts: read-only shell for Lead, a small job hand
   // Looking is open to Lead without anything being declared.
   for (const command of [
     "git branch --contains HEAD",
+    // What Lead is told to look at when it decides where the work starts.
+    "git worktree list",
+    "git status -sb",
+    "git rev-parse --abbrev-ref origin/HEAD",
+    "git branch -a --list '*UDT-1*'",
+    "git branch -r --contains abc123",
+    "git log --oneline -15 main",
     "sed -n 40,60p package.json",
     "sed -n '1,$p' src/a.ts | head -5",
     "find src -name '*.test.tsx' -type f | head -20",
@@ -1914,4 +1944,183 @@ test("21. work in another worktree: the changes, the progress and the risk are j
 
   await cleanup?.();
   for (const folder of [dir, wt, other]) fs.rmSync(folder, { recursive: true, force: true });
+});
+
+test("22. where the work starts: a new worktree from the fetched base, an existing one entered as it is, or the folder the session is in", async () => {
+  const dir = tempProject();
+  const remoteDir = `${dir}-remote.git`;
+  const other = `${dir}-other`;
+  const git = (where, ...args) => execFileSync("git", ["-C", where, ...args], { encoding: "utf8" }).trim();
+  const main = git(dir, "branch", "--show-current");
+  // A remote that has moved on since this clone last looked, and a branch that exists only there.
+  execFileSync("git", ["clone", "--quiet", "--bare", dir, remoteDir], { stdio: "ignore" });
+  git(dir, "remote", "add", "origin", remoteDir);
+  git(dir, "fetch", "--quiet", "origin");
+  execFileSync("git", ["clone", "--quiet", remoteDir, other], { stdio: "ignore" });
+  git(other, "config", "user.email", "t@localhost");
+  git(other, "config", "user.name", "t");
+  fs.writeFileSync(path.join(other, "ahead.txt"), "from the remote\n");
+  git(other, "add", "-A");
+  git(other, "commit", "--quiet", "-m", "remote moved on");
+  git(other, "push", "--quiet", "origin", main);
+  const ahead = git(other, "rev-parse", "HEAD");
+  git(other, "checkout", "--quiet", "-b", "feat/remote");
+  fs.writeFileSync(path.join(other, "remote-only.txt"), "x\n");
+  git(other, "add", "-A");
+  git(other, "commit", "--quiet", "-m", "work in progress elsewhere");
+  git(other, "push", "--quiet", "origin", "feat/remote");
+  assert.notEqual(git(dir, "rev-parse", `origin/${main}`), ahead);
+
+  const mock = createMockOpenCode({ maxHandoffsPerTurn: 40 });
+  const cleanup = await plugin.setup(mock.ctx);
+  mock.sessions.get("ses_1").location = { directory: dir };
+  const toFellow = mock.tools.get("handoff_to_fellow");
+  const toLead = mock.tools.get("handoff_to_lead");
+  const asLead = { sessionID: "ses_1", agent: "lead" };
+  const asFellow = { sessionID: "ses_1", agent: "fellow" };
+  const state = () => mock.storage.get("fusion:ses_1");
+  const here = () => mock.sessions.get("ses_1").location.directory;
+  const same = (a, b) => assert.equal(path.resolve(a).toLowerCase(), path.resolve(b).toLowerCase());
+  const back = () => toLead.execute({ reason: "completed", summary: "done" }, asFellow);
+  const made = [];
+
+  assert.match(mock.agents.get("lead").system, /Decide where the work starts, once, before the first handoff/);
+  assert.doesNotMatch(mock.agents.get("lead").system, /ask the user with the `question` tool to confirm the place/);
+
+  // A new branch from the default branch: fetched first, made next to the repository, and the session moves there.
+  const wtX = `${dir}-feat-x`;
+  made.push(wtX);
+  const first = await toFellow.execute({ summary: "Add the feature", startIn: { branch: "feat/x" } }, asLead);
+  assert.match(first.content, new RegExp(`Work location: \\S+-feat-x \\(branch feat/x, started from origin/${main}\\), a worktree made for this work\\. The session moves there with this handoff`));
+  assert.equal(git(wtX, "branch", "--show-current"), "feat/x");
+  assert.equal(git(wtX, "rev-parse", "HEAD"), ahead);                       // the remote's newest, not this clone's stale copy
+  assert.throws(() => execFileSync("git", ["-C", wtX, "rev-parse", "--abbrev-ref", "feat/x@{upstream}"], { stdio: "ignore" }));   // a new branch does not follow its base
+  assert.equal(mock.moveCalls.length, 1);
+  assert.equal(mock.moveCalls[0].delivery, "steer");
+  same(here(), wtX);
+  assert.equal(state().role, "fellow");
+  assert.ok(state().workDirs.some((entry) => path.resolve(entry).toLowerCase() === path.resolve(wtX).toLowerCase()));
+  // What Fellow does there is what Lead is shown.
+  fs.writeFileSync(path.join(wtX, "feature.txt"), "new\n");
+  git(wtX, "add", "-A");
+  git(wtX, "commit", "--quiet", "-m", "add the feature");
+  const firstBack = await back();
+  assert.match(firstBack.content, /Changes since this work began \(1 file\(s\), 1 commit\(s\)\):/);
+  assert.match(firstBack.content, /commit [0-9a-f]{7,} add the feature/);
+  same(git(dir, "rev-parse", "--show-toplevel"), dir);
+  assert.equal(fs.existsSync(path.join(dir, "feature.txt")), false);       // the folder the session began in is untouched
+
+  // Refusals leave Lead in place and cost no handoff.
+  const used = state().handoffsInTurn;
+  await assert.rejects(() => toFellow.execute({ summary: "x", startIn: { worktree: os.tmpdir() } }, asLead), /is not a worktree of this repository\. Its worktrees: /);
+  await assert.rejects(() => toFellow.execute({ summary: "x", startIn: { branch: "feat/x" } }, asLead), /Branch feat\/x is already open in \S+-feat-x\. To work there: `startIn: \{ worktree: /);
+  await assert.rejects(() => toFellow.execute({ summary: "x", startIn: { base: "no-such-line", branch: "feat/y" } }, asLead), /nothing named no-such-line here or on origin/);
+  await assert.rejects(() => toFellow.execute({ summary: "x", startIn: { base: "no-such-line" } }, asLead), /no branch named no-such-line here or on origin/);
+  await assert.rejects(() => toFellow.execute({ summary: "x", startIn: { worktree: wtX, base: main } }, asLead), /give either `worktree`/);
+  await assert.rejects(() => toFellow.execute({ summary: "x", startIn: { base: main, branch: "bad..name" } }, asLead), /is not a valid branch name/);
+  await assert.rejects(() => toFellow.execute({ summary: "x", startIn: { base: main, branch: "feat/remote" } }, asLead), /Branch feat\/remote already exists\. To work on it: `startIn: \{ base: "feat\/remote" \}`/);
+  assert.equal(state().role, "lead");
+  assert.equal(state().handoffsInTurn, used);
+  assert.equal(mock.moveCalls.length, 1);
+
+  // A worktree that exists is entered as it is; what was already lying there is said.
+  fs.writeFileSync(path.join(dir, "stray.txt"), "left over\n");
+  const second = await toFellow.execute({ summary: "Go on in the first folder", startIn: { worktree: dir } }, asLead);
+  assert.match(second.content, /Work location: \S+ \(branch \S+\)\. The session moves there with this handoff/);
+  assert.doesNotMatch(second.content, /a worktree made for this work/);
+  assert.match(second.content, /- 1 uncommitted change\(s\) were already there; they are not part of this work unless the plan says so\./);
+  same(here(), dir);
+  await back();
+  fs.rmSync(path.join(dir, "stray.txt"));
+
+  // Naming the place the session is in moves nothing.
+  const third = await toFellow.execute({ summary: "Stay", startIn: { worktree: dir } }, asLead);
+  assert.match(third.content, /This is the folder the session is already in; nothing moved\./);
+  assert.equal(mock.moveCalls.length, 2);
+  await back();
+
+  // Working on a branch itself: one that is open somewhere is entered, not made twice.
+  const fourth = await toFellow.execute({ summary: "Add to the feature", startIn: { base: "feat/x" } }, asLead);
+  assert.match(fourth.content, /- feat\/x was already open in this worktree, so nothing new was made\./);
+  same(here(), wtX);
+  assert.equal(fs.existsSync(`${dir}-feat-x-2`), false);
+  await back();
+
+  // A branch that exists only on the remote gets a worktree of its own, on a local branch that follows it.
+  const wtRemote = `${dir}-feat-remote`;
+  made.push(wtRemote);
+  const fifth = await toFellow.execute({ summary: "Add to the work in progress", startIn: { base: "feat/remote" } }, asLead);
+  assert.match(fifth.content, /\(branch feat\/remote, started from origin\/feat\/remote\), a worktree made for this work/);
+  assert.equal(git(wtRemote, "branch", "--show-current"), "feat/remote");
+  assert.equal(git(wtRemote, "rev-parse", "--abbrev-ref", "feat/remote@{upstream}"), "origin/feat/remote");
+  assert.equal(fs.existsSync(path.join(wtRemote, "remote-only.txt")), true);
+  await back();
+
+  // A local branch that is behind its remote is brought up to it when it is opened.
+  git(other, "checkout", "--quiet", main);
+  fs.writeFileSync(path.join(other, "later.txt"), "later\n");
+  git(other, "add", "-A");
+  git(other, "commit", "--quiet", "-m", "later still");
+  git(other, "push", "--quiet", "origin", main);
+  git(dir, "branch", "release", `origin/${main}~1`);
+  git(other, "push", "--quiet", "origin", `${main}:release`);
+  const wtRelease = `${dir}-release`;
+  made.push(wtRelease);
+  const sixth = await toFellow.execute({ summary: "Fix on the release line", startIn: { base: "release" } }, asLead);
+  assert.match(sixth.content, /- The local release was behind origin\/release and was brought up to it\./);
+  assert.equal(git(wtRelease, "rev-parse", "HEAD"), git(other, "rev-parse", "HEAD"));
+  await back();
+
+  // /worktree: the same by hand. A new name starts from the default branch; a known one is entered; Fellow's turn is left alone.
+  const command = mock.commands.get("worktree");
+  const wtCmd = `${dir}-feat-cmd`;
+  made.push(wtCmd);
+  await command.execute({ sessionID: "ses_1", prompt: { text: "feat/cmd" } });
+  assert.match(mock.syntheticCalls.at(-1).text, /\[FUSION: THE USER CHOSE WHERE THE WORK IS DONE\]\nWork location: \S+-feat-cmd \(branch feat\/cmd, started from origin\/\S+\), a worktree made for this work\. The session moves there now:/);
+  assert.match(mock.syntheticCalls.at(-1).text, /say in one line where the session is now, look at nothing, and wait for the user's request\.$/);
+  assert.equal(mock.syntheticCalls.at(-1).resume, false);
+  assert.equal(git(wtCmd, "branch", "--show-current"), "feat/cmd");
+  same(here(), wtCmd);
+  await command.execute({ sessionID: "ses_1", prompt: { text: "feat/x" } });
+  same(here(), wtX);
+  await command.execute({ sessionID: "ses_1", prompt: { text: "" } });
+  assert.match(mock.syntheticCalls.at(-1).text, /\/worktree <branch> \[base\]\n[\s\S]*Worktrees now: /);
+  await toFellow.execute({ summary: "Something small" }, asLead);
+  const movesBefore = mock.moveCalls.length;
+  await command.execute({ sessionID: "ses_1", prompt: { text: "feat/other" } });
+  assert.match(mock.syntheticCalls.at(-1).text, /Fellow is in the middle of work/);
+  assert.equal(mock.moveCalls.length, movesBefore);
+  await back();
+  await cleanup?.();
+
+  // When the host can make worktrees itself, it is asked to (so the project's own set-up command runs).
+  const hosted = createMockOpenCode({}, { hostWorktree: dir });
+  const cleanupHosted = await plugin.setup(hosted.ctx);
+  hosted.sessions.get("ses_1").location = { directory: dir };
+  hosted.sessions.get("ses_1").projectID = "prj_1";
+  made.push(`${dir}-feat-host`);
+  const viaHost = await hosted.tools.get("handoff_to_fellow").execute({ summary: "Add", startIn: { base: main, branch: "feat/host" } }, asLead);
+  assert.equal(hosted.hostCreates.length, 1);
+  assert.equal(hosted.hostCreates[0].projectID, "prj_1");
+  assert.equal(hosted.hostCreates[0].name, `${path.basename(dir)}-feat-host`);
+  assert.equal(hosted.hostCreates[0].branch, `origin/${main}`);
+  assert.match(viaHost.content, /\(branch feat\/host, started from origin\/\S+\), a worktree made for this work/);
+  assert.equal(git(`${dir}-feat-host`, "branch", "--show-current"), "feat/host");
+  await cleanupHosted?.();
+
+  // Switched off, the field is refused and Lead is not told about it; on "ask", Lead confirms with the user first.
+  const off = createMockOpenCode({ startLocation: "off" });
+  const cleanupOff = await plugin.setup(off.ctx);
+  off.sessions.get("ses_1").location = { directory: dir };
+  assert.doesNotMatch(off.agents.get("lead").system, /Decide where the work starts/);
+  await assert.rejects(() => off.tools.get("handoff_to_fellow").execute({ summary: "x", startIn: { branch: "feat/off" } }, asLead), /`startIn` is switched off here/);
+  assert.equal(fs.existsSync(`${dir}-feat-off`), false);
+  await cleanupOff?.();
+  const ask = createMockOpenCode({ startLocation: "ask" });
+  const cleanupAsk = await plugin.setup(ask.ctx);
+  assert.match(ask.agents.get("lead").system, /Before any handoff with `startIn`, ask the user with the `question` tool to confirm the place you chose/);
+  await cleanupAsk?.();
+
+  for (const folder of made) execFileSync("git", ["-C", dir, "worktree", "remove", "--force", folder], { stdio: "ignore" });
+  for (const folder of [dir, other, remoteDir]) fs.rmSync(folder, { recursive: true, force: true });
 });

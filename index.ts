@@ -38,10 +38,14 @@
  * - Evidence with the report: a checkpoint or a hand-back carries what changed since the work began (commits,
  *   diffstat, the first part of the diff), so Lead reviews the change itself and not a description of it. The work is
  *   measured wherever it happens: every worktree of the repository, and other repositories Fellow ran commands in.
+ * - Where the work starts: `startIn` on `handoff_to_fellow` (an existing worktree, or a base branch and a new branch),
+ *   settled by Lead from the repository itself. Fusion fetches, has the host make the worktree and moves the session
+ *   there (`session.move`) before Fellow's first step, so everything above is measured in the session's own folder.
+ *   `/worktree` does the same by hand.
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import nodePath from "node:path";
 
@@ -177,6 +181,8 @@ interface PluginOptions {
   verifyRetries?: number;
   checkTimeoutSeconds?: number;
   maxStalledReturns?: number;
+  /** Whether Lead chooses where the work starts (a worktree, a base branch): "auto" (default), "ask" (asks the user first), "off". */
+  startLocation?: "auto" | "ask" | "off";
   // Changed files outside the plan's `files` (and their folders) beyond this number wake Lead at a checkpoint.
   offPlanFilesLimit?: number;
   // The name of the mode in the mode list. Given here it cannot be changed from `/fusion-settings`.
@@ -514,9 +520,19 @@ const BENIGN_EXIT_ONE_COMMANDS = new Set([
 // Stands for the scout's agent id inside LEAD_PROMPT until the id is known (it follows the Fellow's name).
 const SCOUT_PLACEHOLDER = "\u0000scout\u0000";
 
+// How Lead decides where a piece of work starts. Nothing here names a team's branches: the repository is the evidence.
+const START_PROMPT = [
+  "- Decide where the work starts, once, before the first handoff of a piece of work that changes something, and tell the user where and why in one line. The question is where the thing this work touches lives now. Look: `git worktree list`, `git status -sb`, `git branch -a --list '*<ticket or feature name>*'`, `git branch -r --contains <commit>`, `git log --oneline -15 <branch>`, `git rev-parse --abbrev-ref origin/HEAD` for the default branch, the repository's own guide files, and the request or its ticket. There are three answers.",
+  "  1. Here: the session's folder is already on the branch this work belongs to, or the job is a lookup, a small fix to what is here, or work the user asked for in this folder. Leave `startIn` out. This is a proper answer, not a fallback; do not make a worktree for work that does not need one.",
+  "  2. A worktree that exists: the branch this work belongs to is already open in another worktree. `startIn: { worktree: \"<its path>\" }`.",
+  "  3. A new worktree: nothing holds this work yet. `startIn: { base, branch }`. `base` is the branch the work belongs on: the default branch for something new; the branch of work in progress when this adds to it; a shared branch other than the default (a QA or release line) when what is being fixed exists only there. `branch` is the new branch to create from it, named the way the repository's branches are named. Leave `branch` out to work on `base` itself: right for a feature branch, wrong for a branch other people share, which gets a new branch cut from it.",
+  "  Fusion does the rest at the handoff: it fetches `base`, makes the worktree next to the repository, and moves the session there; Fellow starts in that folder and you review there. You create nothing yourself. When the evidence does not single out one base (several candidate branches, no sign of which line the fix belongs on), ask the user, offering the candidates you found. A later handoff of the same work has no `startIn`: the session is already there. Give it again only when the user turns to different work that belongs somewhere else.",
+].join("\n");
+const START_ASK_PROMPT = "  Before any handoff with `startIn`, ask the user with the `question` tool to confirm the place you chose (the folder or base branch, the new branch name, and your reason), and go on only when they agree.";
+
 const LEAD_PROMPT = [
   "You are the Fusion LEAD: you read, decide how the work gets done, and review the result. You are the stronger and dearer model; Fellow is the cheaper one that does all the editing and all the running. You never change files or run anything that has effects yourself.",
-  "- Inspect with read-only tools (read, glob, grep, webfetch, websearch, question, skill, session read/search, worktree list) and read-only shell commands (git log / status / diff / show / blame / branch --list, ls, cat, head, tail, wc, grep, rg, and pipes between them). Any other shell command is refused.",
+  "- Inspect with read-only tools (read, glob, grep, webfetch, websearch, question, skill, session read/search, worktree list) and read-only shell commands (git log / status / diff / show / blame / branch --list / worktree list, ls, cat, head, tail, wc, grep, rg, and pipes between them). Any other shell command is refused.",
   "- Looking things up goes to the scout: call the `subagent` tool with agent `" + SCOUT_PLACEHOLDER + "`. Use it whenever only the answer matters and not the raw material: a chat thread, a ticket, logs, a web page, frames of a video, anything behind tools you do not have (Code Mode `execute`, MCP tools), and finding out where something lives in the code or how a wide area of it works. The scout starts with none of this conversation, so the task you give it must stand alone: what to find, where to look, what to report. It runs in the background on the cheaper model and you are woken with a short report; start several at once when the questions are independent, then end your response and wait. Its raw material never enters this conversation, which is the point: everything you read yourself is reread, at your price and at Fellow's, on every later step. Read files yourself when you need their exact text to write the plan (the few files that will change), not to explore.",
   "- Say what you did not see. When the work rests on something you could not look at yourself (a design file that would not open, a ticket, a screenshot, a scout's report that says it could not reach something), tell the user before you hand the work over: what you could not see, what you are assuming in its place, and which parts of the result depend on that. Do not describe work as matching a design, a spec or a request that nobody actually read, and do not let a later summary upgrade 'looked at a screenshot' into 'matches the design'.",
   "- Everything that changes something goes to Fellow through `handoff_to_fellow`, however small: edits, installs, builds, tests, dev servers, screenshots, commits, pushes, deploys, pull requests. Never attempt edits, Code Mode execute, or worktree/session mutations yourself, and start no subagent other than the scout. Do not do a job in pieces through your own tools to avoid a handoff.",
@@ -1244,6 +1260,115 @@ function treeOutside(dir: string, known: string[]): string | undefined {
 }
 
 /** The folders a command line names as where it works: `cd X`, `git -C X`, `yarn --cwd X`, `npm --prefix X`. */
+function errorMessage(err: unknown): string {
+  const text = err instanceof Error ? err.message : typeof err === "string" ? err : JSON.stringify(err);
+  return String(text ?? "unknown error").trim().slice(0, 400);
+}
+
+/** Where a piece of work starts, as Lead asks for it: an existing worktree, or a base to start a new one from. */
+interface StartRequest {
+  worktree?: string;
+  base?: string;
+  branch?: string;
+}
+
+/** Where it starts, once settled. */
+interface StartPlace {
+  directory: string;
+  branch: string;
+  from?: string;
+  made: boolean;
+  moved: boolean;
+  notes: string[];
+}
+
+interface WorktreeEntry {
+  path: string;
+  branch: string;
+}
+
+/** Every worktree of the repository, the main one first, with the branch it has checked out ("" when detached). */
+function listWorktrees(root: string): WorktreeEntry[] {
+  const out: WorktreeEntry[] = [];
+  let current: WorktreeEntry | undefined;
+  for (const line of gitText(root, ["worktree", "list", "--porcelain"]).split("\n")) {
+    if (line.startsWith("worktree ")) {
+      current = { path: nodePath.resolve(line.slice("worktree ".length).trim()).replace(/\\/g, "/"), branch: "" };
+      out.push(current);
+    } else if (line.startsWith("branch ") && current) current.branch = line.slice("branch ".length).trim().replace(/^refs\/heads\//, "");
+  }
+  return out;
+}
+
+/** git for the steps that can take long in a large repository: a fetch, a checkout into a new folder. */
+function gitSlow(dir: string, args: string[], timeoutMs: number) {
+  return spawnSync("git", ["-C", dir, ...args], { encoding: "utf8", windowsHide: true, timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
+}
+
+function gitFailure(res: { stderr?: string | null; error?: Error }): string {
+  const text = (typeof res.stderr === "string" ? res.stderr : "") || res.error?.message || "git failed";
+  return text.trim().split("\n").slice(-1)[0].slice(0, 300);
+}
+
+function refExists(root: string, ref: string): boolean {
+  return gitIn(root, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`]).status === 0;
+}
+
+/** The remote to start from: `origin` when there is one, else the first, else none. */
+function mainRemote(root: string): string {
+  const remotes = gitText(root, ["remote"]).split("\n").filter(Boolean);
+  return remotes.includes("origin") ? "origin" : remotes[0] ?? "";
+}
+
+/** The repository's default branch: what the remote says, else `main` or `master` when there, else the branch of the main worktree. */
+function defaultBranch(root: string, remote: string): string {
+  if (remote) {
+    const head = gitText(root, ["rev-parse", "--abbrev-ref", `${remote}/HEAD`]);
+    if (head.startsWith(`${remote}/`) && head !== `${remote}/HEAD`) return head.slice(remote.length + 1);
+    const asked = /^ref:\s+refs\/heads\/(\S+)\s+HEAD/m.exec(gitText(root, ["ls-remote", "--symref", remote, "HEAD"]));
+    if (asked) return asked[1];
+  }
+  for (const name of ["main", "master"]) {
+    if (refExists(root, remote ? `${remote}/${name}` : name) || refExists(root, name)) return name;
+  }
+  return listWorktrees(root)[0]?.branch ?? "";
+}
+
+/** What Lead should know about a tree that was already there, before work is added to it. */
+function placeNotes(dir: string): string[] {
+  const notes: string[] = [];
+  const dirty = gitText(dir, ["status", "--porcelain"]).split("\n").filter(Boolean).length;
+  if (dirty > 0) notes.push(`${dirty} uncommitted change(s) were already there; they are not part of this work unless the plan says so.`);
+  const behind = Number(gitText(dir, ["rev-list", "--count", "HEAD..@{upstream}"]));
+  if (behind > 0) notes.push(`The branch is ${behind} commit(s) behind its upstream as last fetched; nothing was pulled.`);
+  return notes;
+}
+
+function sanitizeStart(value: unknown): StartRequest | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const pick = (key: string) => {
+    const raw = (value as Record<string, unknown>)[key];
+    return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
+  };
+  const request: StartRequest = { worktree: pick("worktree"), base: pick("base"), branch: pick("branch") };
+  if (!request.worktree && !request.base && !request.branch) return undefined;
+  if (request.worktree && (request.base || request.branch)) {
+    throw new Error("`startIn`: give either `worktree` (work in one that exists) or `base` / `branch` (start a new one), not both.");
+  }
+  return request;
+}
+
+function describePlace(place: StartPlace): string[] {
+  return [
+    `Work location: ${place.directory} (${place.branch ? `branch ${place.branch}` : "no branch"}${place.from ? `, started from ${place.from}` : ""})${place.made ? ", a worktree made for this work" : ""}. ${
+      place.moved
+        ? "The session moves there with this handoff: from the next step on, relative paths and commands are in that folder. If a command still shows the old folder, name this one as the command's working directory."
+        : "This is the folder the session is already in; nothing moved."
+    }`,
+    ...place.notes.map((note) => `  - ${note}`),
+  ];
+}
+
 function commandFolders(command: string, runsIn: string): string[] {
   const lines = splitShellCommands(command.replace(/\d?>>?\s*("[^"]*"|'[^']*'|[^\s|;&]+)/g, " "), false) ?? [command.trim().split(/\s+/)];
   const out: string[] = [];
@@ -1631,7 +1756,8 @@ export default {
     // The scout is named after the Fellow when the plain name is taken by one of the two.
     const scoutAgentID = [DEFAULT_SCOUT_NAME, `${fellowAgentID}-scout`].find((id) => id !== fellowAgentID && id !== modeNameInForce.toLowerCase()) ?? `${fellowAgentID}-scout`;
     const AGENT: Record<AgentKey, string> = { lead: modeNameInForce.toLowerCase(), fellow: fellowAgentID, scout: scoutAgentID };
-    const leadPrompt = LEAD_PROMPT.replace(SCOUT_PLACEHOLDER, scoutAgentID);
+    const startMode: "auto" | "ask" | "off" = rawOptions.startLocation === "off" || rawOptions.startLocation === "ask" ? rawOptions.startLocation : "auto";
+    const leadPrompt = [LEAD_PROMPT.replace(SCOUT_PLACEHOLDER, scoutAgentID), ...(startMode === "off" ? [] : [START_PROMPT, ...(startMode === "ask" ? [START_ASK_PROMPT] : [])])].join("\n");
     // The saved model this plugin last put on each agent, so a later rebuild does not mistake it for configuration.
     const appliedModel: RoleModels & { scout?: ModelRef } = {};
     const maxConsecutiveFailures = normalizePositiveInt(
@@ -2056,6 +2182,122 @@ export default {
       if (added) await saveState({ ...state, revision: state.revision + 1 }, { emit: false });
     }
 
+    /** Makes a worktree for `ref` next to the repository and returns its folder. The host makes it when it can, so the project's own set-up command runs. */
+    async function makeWorktree(sessionID: string, root: string, name: string, ref: string): Promise<string> {
+      const main = listWorktrees(root)[0]?.path ?? root;
+      const parent = nodePath.dirname(main);
+      const folder = `${nodePath.basename(main)}-${name.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "work"}`;
+      const ses = await ctx.session.get({ sessionID }).catch(() => undefined);
+      const projectID = ses?.projectID ?? ctx.location?.project?.id;
+      let hostFailure = "";
+      if (typeof ctx.worktree?.create === "function" && projectID) {
+        try {
+          const made = await ctx.worktree.create({ projectID, directory: nodePath.resolve(parent), name: folder, branch: ref });
+          const directory = made?.directory ?? made?.data?.directory;
+          if (typeof directory === "string" && directory) return nodePath.resolve(directory).replace(/\\/g, "/");
+        } catch (err) {
+          hostFailure = errorMessage(err);
+        }
+      }
+      let target = nodePath.join(parent, folder);
+      for (let n = 2; existsSync(target) && n <= 10; n += 1) target = nodePath.join(parent, `${folder}-${n}`);
+      const added = gitSlow(root, ["worktree", "add", "--detach", "--quiet", target, ref], 600_000);
+      if (added.status !== 0) {
+        throw new Error(`Could not make a worktree at ${target}: ${gitFailure(added)}${hostFailure ? ` (the host's own attempt: ${hostFailure})` : ""}`);
+      }
+      if (typeof ctx.worktree?.refresh === "function" && projectID) await Promise.resolve(ctx.worktree.refresh({ projectID })).catch(() => undefined);
+      return nodePath.resolve(target).replace(/\\/g, "/");
+    }
+
+    /**
+     * Settles where the work starts and moves the session there. An existing worktree is entered as it is; a new one is
+     * made from the freshly fetched base. Nothing that exists is changed, except that a local branch behind its remote is
+     * fast-forwarded when it is checked out new.
+     */
+    async function startPlace(sessionID: string, root: string, request: StartRequest, delivery: string): Promise<StartPlace> {
+      const top = gitText(root, ["rev-parse", "--show-toplevel"]);
+      if (!top) throw new Error("`startIn` needs a git repository, and this folder is not one. Hand the work over without it.");
+      const trees = listWorktrees(root);
+      const describeTrees = () => trees.map((tree) => `${tree.path} (${tree.branch || "no branch"})`).join("; ");
+      const enter = async (directory: string, branch: string, made: boolean, from: string | undefined, notes: string[]): Promise<StartPlace> => {
+        if (samePath(directory, top)) return { directory, branch, from, made, moved: false, notes };
+        try {
+          await ctx.session.move({ sessionID, directory: nodePath.resolve(directory), delivery });
+        } catch (err) {
+          throw new Error(`The session could not move to ${directory}: ${errorMessage(err)}${made ? " The worktree was made and is still there; name it as `startIn.worktree` to try again." : ""}`);
+        }
+        return { directory, branch, from, made, moved: true, notes };
+      };
+
+      if (request.worktree) {
+        const asked = nodePath.resolve(root, request.worktree);
+        const askedTop = gitText(asked, ["rev-parse", "--show-toplevel"]) || asked;
+        const tree = trees.find((entry) => samePath(entry.path, askedTop));
+        if (!tree) {
+          throw new Error(`\`startIn.worktree\`: ${request.worktree} is not a worktree of this repository. Its worktrees: ${describeTrees()}. To start a new one give \`base\` (and \`branch\`) instead.`);
+        }
+        return enter(tree.path, tree.branch, false, undefined, placeNotes(tree.path));
+      }
+
+      const remote = mainRemote(root);
+      const given = request.base ?? defaultBranch(root, remote);
+      if (!given) throw new Error("`startIn.base`: the default branch could not be found. Name the base branch.");
+      const base = remote && given.startsWith(`${remote}/`) ? given.slice(remote.length + 1) : given;
+      const remoteRef = remote ? `${remote}/${base}` : "";
+      const notes: string[] = [];
+      if (remote) {
+        const fetched = gitSlow(root, ["fetch", "--quiet", remote, base], 180_000);
+        if (fetched.status !== 0 && refExists(root, remoteRef)) {
+          notes.push(`${base} could not be fetched from ${remote} (${gitFailure(fetched)}); this starts from the last fetched state, which may be behind.`);
+        }
+      }
+      const onRemote = Boolean(remoteRef) && refExists(root, remoteRef);
+      const local = gitIn(root, ["show-ref", "--verify", "--quiet", `refs/heads/${base}`]).status === 0;
+
+      if (request.branch) {
+        const branch = request.branch;
+        if (gitIn(root, ["check-ref-format", "--branch", branch]).status !== 0) throw new Error(`\`startIn.branch\`: ${branch} is not a valid branch name.`);
+        const open = trees.find((entry) => entry.branch === branch);
+        if (open) throw new Error(`Branch ${branch} is already open in ${open.path}. To work there: \`startIn: { worktree: "${open.path}" }\`.`);
+        // The remote is asked too: a branch someone else pushed may never have been fetched here.
+        const taken =
+          gitIn(root, ["show-ref", "--verify", "--quiet", `refs/heads/${branch}`]).status === 0 ||
+          (Boolean(remote) && (refExists(root, `${remote}/${branch}`) || gitSlow(root, ["ls-remote", "--exit-code", "--heads", remote, `refs/heads/${branch}`], 30_000).status === 0));
+        if (taken) {
+          throw new Error(`Branch ${branch} already exists. To work on it: \`startIn: { base: "${branch}" }\` with no \`branch\`. For a new branch, choose another name.`);
+        }
+        const from = onRemote ? remoteRef : refExists(root, given) ? given : "";
+        if (!from) throw new Error(`\`startIn.base\`: nothing named ${given} here${remote ? ` or on ${remote}` : ""}. Look with \`git branch -a\`.`);
+        const directory = await makeWorktree(sessionID, root, branch, from);
+        const made = gitSlow(directory, ["checkout", "--quiet", "--no-track", "-b", branch], 60_000);
+        if (made.status !== 0) throw new Error(`The worktree is at ${directory}, but branch ${branch} could not be created there: ${gitFailure(made)}`);
+        return enter(directory, branch, true, from, notes);
+      }
+
+      // No new branch: the work goes on `base` itself.
+      const open = trees.find((entry) => entry.branch === base);
+      if (open) return enter(open.path, base, false, undefined, [`${base} was already open in this worktree, so nothing new was made.`, ...notes, ...placeNotes(open.path)]);
+      if (!local && !onRemote) {
+        throw new Error(
+          refExists(root, given)
+            ? `\`startIn.base\`: ${given} is not a branch. Give \`branch\` as well, to start a new branch from it.`
+            : `\`startIn.base\`: no branch named ${given} here${remote ? ` or on ${remote}` : ""}. Look with \`git branch -a\`.`,
+        );
+      }
+      const directory = await makeWorktree(sessionID, root, base, local ? base : remoteRef);
+      const checkedOut = local
+        ? gitSlow(directory, ["checkout", "--quiet", base], 60_000)
+        : gitSlow(directory, ["checkout", "--quiet", "--track", "-b", base, remoteRef], 60_000);
+      if (checkedOut.status !== 0) throw new Error(`The worktree is at ${directory}, but ${base} could not be checked out there: ${gitFailure(checkedOut)}`);
+      if (local && onRemote) {
+        const was = gitText(directory, ["rev-parse", "HEAD"]);
+        const forward = gitSlow(directory, ["merge", "--ff-only", "--quiet", remoteRef], 60_000);
+        if (forward.status !== 0) notes.push(`The local ${base} and ${remoteRef} have gone different ways; it was left as it is.`);
+        else if (gitText(directory, ["rev-parse", "HEAD"]) !== was) notes.push(`The local ${base} was behind ${remoteRef} and was brought up to it.`);
+      }
+      return enter(directory, base, true, local ? base : remoteRef, notes);
+    }
+
     async function sessionRoot(sessionID: string): Promise<string> {
       const ses = await ctx.session.get({ sessionID }).catch(() => undefined);
       return ses?.location?.directory ?? ses?.directory ?? process.cwd();
@@ -2158,6 +2400,17 @@ export default {
               description:
                 "Commands Fusion runs itself when Fellow reports completion (type check or build, tests). Failing ones go back to Fellow.",
             },
+            startIn: {
+              type: "object",
+              properties: {
+                worktree: { type: "string", description: "Path of a worktree of this repository that already exists, to do the work there." },
+                base: { type: "string", description: "For a new worktree: the branch the work starts from (the default branch, a feature branch, a shared QA or release branch). Fusion fetches it first. Omitted with `branch` given: the default branch." },
+                branch: { type: "string", description: "For a new worktree: the new branch to create from `base`. Leave out to work on the `base` branch itself." },
+              },
+              additionalProperties: false,
+              description:
+                "Where the work is done, when not in the folder the session is in now. Fusion makes the worktree if needed and moves the session there before Fellow starts. Leave out to stay here, and on every later handoff of the same work.",
+            },
           },
           required: ["summary"],
           additionalProperties: false,
@@ -2225,6 +2478,13 @@ export default {
               createdAt: new Date().toISOString(),
             };
 
+            // Where the work starts is settled before anything else changes: a refusal here leaves Lead in place.
+            const startRequest = sanitizeStart(args?.startIn);
+            if (startRequest && startMode === "off") {
+              throw new Error('`startIn` is switched off here (`startLocation: "off"`). Hand the work over without it; Fellow can make a worktree as a step of the plan.');
+            }
+            const place = startRequest ? await startPlace(sessionID, await sessionRoot(sessionID), startRequest, "steer") : undefined;
+
             const switched = await switchRole({
               sessionID,
               state,
@@ -2232,10 +2492,12 @@ export default {
               activePlan: plan,
               incrementHandoffs: true,
             });
-            const startRoot = await sessionRoot(sessionID);
-            const startHash = workFingerprint(startRoot, state.workDirs);
-            const startBase = snapshotWork(startRoot, state.workDirs);
-            const next: FusionState = { ...switched, phaseIndex: 0, phaseBounces: 0, ...(startHash ? { lastWorkHash: startHash } : {}), ...(startBase ? { roundBase: startBase, phaseBase: startBase } : {}) };
+            // The move takes effect at the next step, so the place is named here and not read back from the session.
+            const startRoot = place?.directory ?? (await sessionRoot(sessionID));
+            const startDirs = place && !(state.workDirs ?? []).some((dir) => samePath(dir, place.directory)) ? [...(state.workDirs ?? []), place.directory] : state.workDirs;
+            const startHash = workFingerprint(startRoot, startDirs);
+            const startBase = snapshotWork(startRoot, startDirs);
+            const next: FusionState = { ...switched, phaseIndex: 0, phaseBounces: 0, ...(startDirs ? { workDirs: startDirs } : {}), ...(startHash ? { lastWorkHash: startHash } : {}), ...(startBase ? { roundBase: startBase, phaseBase: startBase } : {}) };
             if (!startHash) delete next.lastWorkHash;
             if (!startBase) {
               delete next.roundBase;
@@ -2249,6 +2511,7 @@ export default {
               content: [
                 "[FUSION: FELLOW MODE ACTIVE]",
                 `Active agent: fellow | Target model: ${formatModelRef(targetModel)} | Epoch: ${next.epoch} | Handoff ${next.handoffsInTurn}/${maxHandoffsPerTurn}`,
+                ...(place ? describePlace(place) : []),
                 `Plan summary: ${plan.summary} (${files.length} files, ${steps.length} steps). Follow active \`fusion.plan\` in instructions. Guardrails: maxConsecutiveFailures=${maxConsecutiveFailures}, maxFellowSteps=${maxFellowSteps}. Call \`handoff_to_lead\` when finished or blocked.`,
                 requirements.length
                   ? `Requirements (${requirements.length}): compare these with the user's original request before you start, and report anything the request asks for that is not here.`
@@ -3161,6 +3424,47 @@ export default {
               delivery: input?.delivery ?? "steer",
               resume: true,
             });
+          });
+        },
+      });
+      editor.add({
+        name: "worktree",
+        description: "Start working in a worktree: /worktree <branch> [base]. Enters it if it exists, makes it otherwise",
+        async execute(input: any) {
+          const sessionID = input?.sessionID;
+          if (!sessionID) return;
+          const delivery = input?.delivery ?? "steer";
+          const say = (text: string, resume = false) => ctx.session.synthetic({ sessionID, text, delivery, resume });
+          await withSessionLock(sessionID, async () => {
+            const state = await loadState(sessionID);
+            const root = await sessionRoot(sessionID);
+            const words = String(input?.prompt?.text ?? "").trim().split(/\s+/).filter(Boolean);
+            const trees = listWorktrees(root);
+            if (words.length === 0 || words.length > 2) {
+              await say(["[FUSION] /worktree <branch> [base]", "Enters the worktree that has <branch>, opens <branch> in a new one if the branch exists, or starts it as a new branch from [base] (the default branch when left out).", `Worktrees now: ${trees.map((tree) => `${tree.path} (${tree.branch || "no branch"})`).join("; ") || "(none: not a git repository)"}`].join("\n"));
+              return;
+            }
+            if (state.role !== "lead") {
+              await say("[FUSION] Fellow is in the middle of work. Move when Lead has the turn again.");
+              return;
+            }
+            const [name, base] = words;
+            try {
+              const asPath = nodePath.resolve(root, name);
+              const remote = mainRemote(root);
+              const existing = trees.find((tree) => tree.branch === name || samePath(tree.path, asPath));
+              const known =
+                gitIn(root, ["show-ref", "--verify", "--quiet", `refs/heads/${name}`]).status === 0 ||
+                (Boolean(remote) && gitSlow(root, ["ls-remote", "--exit-code", "--heads", remote, name], 30_000).status === 0);
+              const request: StartRequest = existing ? { worktree: existing.path } : known && !base ? { base: name } : { base, branch: name };
+              const place = await startPlace(sessionID, root, request, delivery);
+              if (place.moved && !(state.workDirs ?? []).some((dir) => samePath(dir, place.directory))) {
+                await saveState({ ...state, workDirs: [...(state.workDirs ?? []), place.directory], revision: state.revision + 1 }, { emit: false });
+              }
+              await say(["[FUSION: THE USER CHOSE WHERE THE WORK IS DONE]", ...describePlace(place).map((line) => line.replace("with this handoff: from the next step on,", "now:")), "Work from here on belongs in this folder; hand it over without `startIn`. Nothing was asked for with this: say in one line where the session is now, look at nothing, and wait for the user's request."].join("\n"));
+            } catch (err) {
+              await say(`[FUSION] /worktree did not go through: ${errorMessage(err)}`);
+            }
           });
         },
       });
